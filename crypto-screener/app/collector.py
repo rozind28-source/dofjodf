@@ -59,6 +59,9 @@ CANDLES_CACHE_MAX = 512         # записей в кэше свечей: бо�
 # раунд из сотен klines-запросов забивал REST-очередь биржи, и /api/candles
 # отваливался по таймауту («бэкенд не ответил» → фронт уходил в демо).
 OHLCV_CHUNK_PAUSE = 1.5         # сек
+GRID_TTL = 45.0                 # сек: кэш готовых сеток /api/grid (см. hub.get_grid)
+CANDLES_FETCH_TIMEOUT = 8.0    # сек: ждём klines у биржи прежде отдать пустоту (api._candles_with_timeout дублирует осознанно)
+GRID_CACHE_MAX = 24             # сколько разных сеток держать (ex×mt×tf×n×порядок)
 
 # --- батчевые WS-подписки -------------------------------------------------
 # Одна задача на чанк символов вместо задачи на символ: при горячем наборе
@@ -1381,8 +1384,14 @@ class ExchangeCollector:
                     await asyncio.sleep(OHLCV_CHUNK_PAUSE)
             await asyncio.sleep(max(60.0, self.settings.ticker_refresh * 3))
 
-    async def _fetch_ohlcv(self, symbol: str) -> None:
+    async def _fetch_ohlcv(self, symbol: str, *, force: bool = False,
+                           ttl: float = CANDLES_TTL) -> None:
         async with self._sem_rest:
+            now = time.time()
+            if not force:
+                st0 = self._state(symbol)
+                if st0.ohlcv and now - getattr(st0, "ohlcv_ts", 0.0) < ttl:
+                    return              # свечи свежие — не плодим лишний REST
             try:
                 candles = await self.ex.fetch_ohlcv(symbol, "1m", limit=self.settings.ohlcv_limit)
                 STORE.bump("rest_calls")
@@ -1606,6 +1615,35 @@ class ExchangeCollector:
     def _has_oi_bulk(self) -> bool:
         return self.cfg.id in ("bybit", "okx", "gate", "mexc")
 
+    async def warm_for_grid(self, symbols: list[str], tf: str, limit: int) -> None:
+        """
+        Подкачка 1m-свечей символам сетки графиков (/api/grid).
+
+        Пока у монеты нет буфера 1m-свечей, каждый запрос сетки обязан тянуть
+        её запрошенный ТФ через REST биржи; при n=9..25 ячеек это очередь из
+        быстрых, но дорогих ответов — часть ячеек отваливается по таймауту и
+        плитки остаются пустыми («график периодически пропадает»). Фоновый
+        _ohlcv_loop обновляет только горячий набор, а пул кандидатов фокуса
+        вообще никем не подкачивался между пересчётами отбора.
+
+        Здесь тот же фоновый цикл, но адресно: символам текущей сетки, с
+        увеличенным TTL (GRID_TTL) — редкие заходы в сетку не превращаются в
+        шторм REST-запросов. Отдельных задач не создаём: разовые gather по
+        чанкам идут внутри уже существующего потока событий.
+        """
+        todo = []
+        now = time.time()
+        for sym in symbols:
+            st = self._state(sym)
+            if not st.ohlcv or now - getattr(st, "ohlcv_ts", 0.0) >= GRID_TTL:
+                todo.append(sym)
+        if not todo:
+            return
+        chunk = max(1, self.settings.ohlcv_concurrency)
+        await asyncio.gather(*[self._fetch_ohlcv(s, force=True, ttl=GRID_TTL)
+                               for s in todo[:chunk * 2]],
+                             return_exceptions=True)
+
     # ------------------------------------------------------------------
     # Свечи для графиков (по требованию, с кэшем)
     # ------------------------------------------------------------------
@@ -1799,6 +1837,8 @@ class CollectorHub:
         self.settings = settings
         self.collectors: list[ExchangeCollector] = []
         self.tasks: list[asyncio.Task] = []
+        # кэш готовых сеток /api/grid: key → (ts, cells); см. get_grid()
+        self._grids: dict[tuple, tuple[float, list]] = {}
 
     async def start(self) -> None:
         if not self.settings.exchanges:
@@ -1834,6 +1874,73 @@ class CollectorHub:
         if c is None:
             return []
         return await c.fetch_candles(symbol, tf, limit)
+
+    # ------------------------------------------------------------------
+    # Сетка графиков (/api/grid): кэш готовых ответов целиком
+    # ------------------------------------------------------------------
+    async def get_grid(self, key: tuple, rows: list[tuple[str, str]], tf: str,
+                 limit: int, build_cell) -> list[dict]:
+        """
+        Ячейки сетки с кэшем на GRID_TTL секунд.
+
+        Ключевое отличие от «кэша свечей на CANDLES_TTL»: ответ сетки
+        переиспользуют ВСЕ клиенты и все варианты ключа (tf, limit), поэтому
+        тикерные поля (цена/изменение) живут дольше своей TTL — их освежает
+        WS-поток: фронт обновляет последнюю свечу каждой плитки на каждом
+        тике (gridTick), а шапку — из строк скринера. Это позволяет отдавать
+        /api/grid мгновенно без единого REST-запроса к бирже в steady-state:
+        сетка больше не зависит от того, успела ли медленная биржа ответить за
+        8 секунд.
+
+        rows: [(exchange_id, symbol)] — маршрутизация и прогрев по ним.
+        build_cell(row, candles) — упаковка строки+свечей в ячейку ответа.
+        """
+        now = time.time()
+        hit = self._grids.get(key)
+        if hit and now - hit[0] < GRID_TTL:
+            return hit[1]
+        cells = []
+        by_col: dict = {}
+        routes: list = []
+        for row in rows:
+            c = self.find(row[0], "")
+            routes.append(c)
+            if c is not None:
+                by_col.setdefault(c, []).append(row[1])
+        # фон: добираем 1m-свечи недостающим символам (см. warm_for_grid)
+        for c, syms in by_col.items():
+            self._grid_warm(c, syms, tf, limit)
+        async def one(row: tuple, c) -> list:
+            if c is None:
+                return []
+            try:
+                return await asyncio.wait_for(
+                    c.fetch_candles(row[1], tf, limit),
+                    timeout=CANDLES_FETCH_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.warning("свечи сетки %s %s: таймаут %.0f c — отдаём resample/пустоту",
+                            row[0], row[1], CANDLES_FETCH_TIMEOUT)
+                return []
+            except Exception:  # noqa: BLE001
+                return []
+
+        # параллельно по всем ячейкам: при последовательном опросе сетка из
+        # 25 плиток на медленной бирже складывалась в минуты ожидания
+        results = await asyncio.gather(*[one(r, c) for r, c in zip(rows, routes)])
+        for row, candles in zip(rows, results):
+            cells.append(build_cell(row, candles))
+        self._grids[key] = (time.time(), cells)
+        if len(self._grids) > GRID_CACHE_MAX:
+            for k in sorted(self._grids, key=lambda k: self._grids[k][0])[:GRID_CACHE_MAX // 2]:
+                del self._grids[k]
+        return cells
+
+    def _grid_warm(self, col, syms: list[str], tf: str, limit: int) -> None:
+        """Разовая фоновая задача прогрева свечей сетки (не ждём ответа)."""
+        t = asyncio.create_task(col.warm_for_grid(syms, tf, limit),
+                                name=f"gridwarm:{col.cfg.id}")
+        self.tasks.append(t)
+        t.add_done_callback(self.tasks.discard)
 
     async def stop(self) -> None:
         for c in self.collectors:

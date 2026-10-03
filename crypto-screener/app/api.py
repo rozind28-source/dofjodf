@@ -719,24 +719,36 @@ async def api_grid(request: Request):
         rows = F.sort_rows(rows, qp.get("sort", "vol"), True)[:n]
 
     hub = getattr(app.state, "hub", None)
-    cells = []
-    for r in rows:
+
+    def build_cell(r: dict, candles: list) -> dict:
         st = STORE.get(r["k"])
-        candles: list = []
-        if hub is not None and st:
-            candles = await _candles_with_timeout(hub, st, tf, limit)
         if not candles and st and st.ohlcv:
+            # биржа не ответила / нет REST-пути (replay) — собираем из 1m-буфера
             candles = resample(st.ohlcv, TF_SECONDS[tf])[-limit:]
         candles = normalize_candle_volume(candles, st.inverse, st.contract_size,
                                           st.ohlcv_vol_in_contracts) if (candles and st) else candles
-        cells.append({
+        return {
             "k": r["k"], "s": r["s"], "b": r["b"], "exl": r["exl"], "mt": r["mt"],
             "dex": r.get("dex", False),
             "last": r["last"], "chg": r["chg"], "vol": r["vol"],
             "natr": r["natr"], "spike": r["spike"],
             "candles": candles,
             "candles_ok": bool(candles),
-        })
+        }
+
+    if hub is not None:
+        # Кэш всей сетки на GRID_TTL + фоновый прогрев 1m-свечей (collector.
+        # get_grid/warm_for_grid): раньше каждая плитка каждые 15 с тянула
+        # klines через троттл-семафор биржи — при медленных биржах очередь
+        # не расходилась за таймаут и плитки рождались пустыми («график
+        # пропал»), а сами запросы держали бэкенд занятым минутами.
+        # Тикерные поля (цена/изменение) внутри кэша устаревают на десятки
+        # секунд — их фронт освежает из WS-потока (gridTick + строки скринера).
+        gkey = (tuple(r["k"] for r in rows), ex, mt, tf, n, limit)
+        cells = await hub.get_grid(gkey, [(r["ex"], r["s"]) for r in rows],
+                                   tf, limit, build_cell)
+    else:
+        cells = [build_cell(r, []) for r in rows]
     return {"cells": cells, "tf": tf, "tf_seconds": TF_SECONDS[tf], "mt": mt,
             "ex": ex, "available_exchanges": available,
             "total": len(rows),
