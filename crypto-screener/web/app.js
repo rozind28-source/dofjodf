@@ -615,6 +615,23 @@ function applyLocalFocus(d) {
   return d;
 }
 
+/**
+ * Компаратор порядка плиток — тот же, что у таблицы скринера (sort/desc из
+ * состояния колонок). null-значения всегда в конце, как в F.sort_rows.
+ */
+function gridSortCmp() {
+  const sortKey = state.sortCol;
+  const desc = state.sortDesc;
+  return (a, b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    const an = av == null, bn = bv == null;
+    if (an && bn) return 0;
+    if (an) return 1;
+    if (bn) return -1;
+    return desc ? bv - av : av - bv;
+  };
+}
+
 function renderFocus(extra) {
   const f = state.focus;
   if (extra && typeof extra === "object") {
@@ -764,11 +781,18 @@ function pushFilters() {
   if (state.view === "densities") loadDensities();
   if (state.view === "map") renderMap();
   if (state.view === "screener") renderTable();
+  if (state.view === "grid") gridRefreshSoon();
 }
 
 function debounce(fn, ms) {
   let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
+
+// сетка графиков = выборка скринера: меняем фильтры/поиск — меняются и
+// плитки. Дебаунс: иначе каждое нажатие в диапазоне дёргает /api/grid.
+const gridRefreshSoon = debounce(() => {
+  if (state.view === "grid") loadGrid();
+}, 600);
 
 /* ============================== WEBSOCKET =============================== */
 function connect() {
@@ -820,6 +844,15 @@ function onRows(m) {
     if (cur) chartTick(cur);
   }
   if (state.view === "grid") {
+    // порядок плиток = порядок скринера: пересортировываем готовые чарты
+    // на месте (CSS order), без пересоздания DOM и без нового запроса
+    const host = $("#charts-grid");
+    const cells = state.grid.cells;
+    if (host && cells.length) {
+      for (const el of Array.from(host.children)) {
+        el.style.order = String(cells.findIndex((c) => c.k === el.dataset.k));
+      }
+    }
     for (const r of state.rows) gridTick(r);
   }
   $("#st-updated").textContent = new Date().toLocaleTimeString("ru-RU");
@@ -920,6 +953,10 @@ function buildGridHead() {
       if (state.sortCol === c.k) state.sortDesc = !state.sortDesc;
       else { state.sortCol = c.k; state.sortDesc = true; }
       buildGridHead(); refilter();
+      // сетка графиков живёт той же сортировкой, что и таблица, — обновляем
+      // сразу, не дожидаясь 15-секундного таймера (иначе плитки остались бы
+      // в старом порядке до следующего цикла loadGrid)
+      if (state.view === "grid") loadGrid();
     });
     tr.appendChild(th);
   }
@@ -1324,21 +1361,33 @@ async function loadGrid() {
   let d = null;
   let failed = false;
   if (!state.demo) {
+    // Сетка = текущая выборка скринера: те же фильтры, поиск и сортировка
+    // (sort/desc приходят из collectQuery — состояния заголовков таблицы).
+    // Пользователь отсортировал, например, по NATR — плитка строится в этом
+    // же порядке, а не по объёму «как серверу удобнее».
+    const q = Object.assign({}, collectQuery(),
+                            { ex: g.ex || "", mt: state.mt, tf: g.tf, n: g.n, limit: 250 });
     try {
-      const r = await fetchT(`/api/grid?ex=${encodeURIComponent(g.ex)}&mt=${state.mt}`
-        + `&tf=${g.tf}&n=${g.n}&limit=250`, 15000);
+      const r = await fetchT("/api/grid?" + new URLSearchParams(q).toString(), 15000);
       if (r.ok) d = await r.json();
       else failed = true;
     } catch (e) { failed = true; d = null; }
   }
-  // Сервер ответил, но ячеек ноль (фокус ещё считает отбор, биржа офлайн,
-  // фильтру ничего не соответствует) — это НЕ повод показывать синтетику:
-  // демо-данные подставляем только когда ответа нет вовсе. Иначе пользователь
-  // видит «графики», которых на бирже не существует.
+  // Сервер ответил, но ячеек ноль (фильтру ничего не соответствует, биржа
+  // офлайн) — это НЕ повод показывать синтетику: демо-данные подставляем
+  // только когда ответа нет вовсе. Иначе пользователь видит «графики»,
+  // которых на бирже не существует.
   if (!d) d = demoGrid();
-  // фокус без бэкенда (DEMO) или бэкенд не ответил: режем выборку на клиенте,
-  // чтобы поведение сетки не зависело от источника данных
-  if (state.focus.enabled && (!state.focus.server || failed)) d = applyLocalFocus(d);
+  // Порядок плиток = порядок скринера. В live-режиме сервер уже отсортировал
+  // ячейки по тем же sort/desc; в DEMO и как страховка при сбое сортируем
+  // сами — так сетка и таблица всегда показывают один и тот же список.
+  if (d && Array.isArray(d.cells)) {
+    d.cells = d.cells.slice().sort(gridSortCmp()).slice(0, g.n);
+    if (state.focus.enabled && (!state.focus.server || failed)) {
+      state.focus.count = d.cells.length;
+      state.focus.keys = d.cells.map((c) => c.k);
+    }
+  }
   if (state.focus.enabled && d && d.focus) renderFocus(d.focus);
   g.lastFailed = failed;
   g.cells = d.cells || [];
