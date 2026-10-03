@@ -459,17 +459,25 @@ class CandleChart {
       e.preventDefault();
       const sc = this._scale(); if (!sc) return;
       const p = pos(e);
-      const anchor = sc.invX(p.x);
+      // Якорь зума — свеча под курсором: она должна остаться на том же месте
+      // экрана. Раньше при захвате за правым краем графика (самая частая
+      // ситуация на live-данных) якорь выходил за пределы окна, а нижний
+      // clamp «to» принудительно раздвигал окно от нулевого индекса — экран
+      // привязывало к левому краю истории вместо точки под курсором.
+      const n = this.data.candles.length;
+      const last = n - 1;
       const span = this.view.to - this.view.from;
+      const anchorIdx = Math.max(this.view.from,
+                                 Math.min(last, this.view.from + sc.invX(p.x)));
+      const frac = span > 0 ? (anchorIdx - this.view.from) / span : 1;
       const k = e.deltaY > 0 ? 1.18 : 1 / 1.18;
       let newSpan = Math.round(span * k);
-      newSpan = Math.max(this.o.minBars, Math.min(this.data.candles.length - 1, newSpan));
+      newSpan = Math.max(this.o.minBars, Math.min(last, newSpan));
       if (newSpan === span) return;
-      const ratio = span > 0 ? anchor / span : 1;
-      let to = Math.round(this.view.from + anchor + (newSpan - span) * ratio);
-      to = Math.min(this.data.candles.length - 1, Math.max(newSpan, to));
-      this.view.to = to;
-      this.view.from = Math.max(0, to - newSpan);
+      let from = Math.round(anchorIdx - frac * newSpan);
+      from = Math.max(0, Math.min(last - newSpan, from));
+      this.view.from = from;
+      this.view.to = from + newSpan;
       this.render();
     }, { passive: false });
 
