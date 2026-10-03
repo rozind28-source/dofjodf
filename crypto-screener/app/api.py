@@ -995,19 +995,28 @@ async def index():
     return JSONResponse({"hint": "frontend не найден; API доступно на /api/*"}, status_code=200)
 
 
+# Статические файлы фронта отдаём с no-cache: браузеры (и их disk cache)
+# иначе держат старую версию скриптов после обновления кода — правки в
+# chart.js/app.js «не применяются», пока не сделаешь жёсткое перезагружение.
+_NOCACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
 @app.get("/app.js")
 async def app_js():
-    return FileResponse(WEB_DIR / "app.js", media_type="application/javascript")
+    return FileResponse(WEB_DIR / "app.js", media_type="application/javascript",
+                        headers=_NOCACHE)
 
 
 @app.get("/chart.js")
 async def chart_js():
-    return FileResponse(WEB_DIR / "chart.js", media_type="application/javascript")
+    return FileResponse(WEB_DIR / "chart.js", media_type="application/javascript",
+                        headers=_NOCACHE)
 
 
 @app.get("/style.css")
 async def style_css():
-    return FileResponse(WEB_DIR / "style.css", media_type="text/css")
+    return FileResponse(WEB_DIR / "style.css", media_type="text/css",
+                        headers=_NOCACHE)
 
 
 @app.get("/healthz")
