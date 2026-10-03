@@ -113,17 +113,25 @@ def _select_cache_key(query: dict[str, Any], with_densities: bool,
 
 
 def select(query: dict[str, Any], with_densities: bool = False,
-           restrict: Optional[set] = None) -> tuple[list[dict], dict]:
+           restrict: Optional[set] = None,
+           prefiltered: Optional[list[dict]] = None) -> tuple[list[dict], dict]:
     """
     Фильтрация + сортировка + пагинация. Единая точка для REST и WS.
 
-    restrict — набор ключей, за который нельзя выходить (фокус-режим: пуш
-    отдаёт только те монеты, которые реально стримятся и рисуются).
+    restrict — набор ключей, за который нельзя выходить (узкий фокус-пуш:
+    отдаём только то, что реально стримится). Никогда не применяем его к
+    REST-выборке (/api/screener): там клиент сам выбирает объём среза.
+
+    prefiltered — уже готовые строки (например, весь рынок из build_rows());
+    переданы явно → restrict игнорируется: caller хочет полную вселенную,
+    сужать её до top-N мы не имеем права.
 
     Результат кэшируется на SELECT_CACHE_TTL по отпечатку (query, densities,
     restrict): несколько клиентов с одинаковым фильтром (типичный случай)
     платят за выборку один раз в такт, а не по разу каждый.
     """
+    if prefiltered is not None:
+        restrict = None
     cache_key = _select_cache_key(query, with_densities, restrict)
     now = time.time()
     hit = _SELECT_CACHE.get(cache_key)
@@ -134,7 +142,8 @@ def select(query: dict[str, Any], with_densities: bool = False,
     params = F.parse_params(query)
     t0 = time.perf_counter()
     needs_dens = with_densities or bool(params.get("dens"))
-    rows = build_rows(with_densities=needs_dens)
+    rows = prefiltered if prefiltered is not None \
+        else build_rows(with_densities=needs_dens)
     if restrict is not None:
         rows = [r for r in rows if r["k"] in restrict]
     dup = F.base_universe(rows) if params.get("unique") else None
@@ -503,17 +512,48 @@ async def api_meta():
     }
 
 
+def _full_market_rows(query: dict[str, Any]) -> list[dict]:
+    """
+    Строки всего рынка для REST-выборки в фокус-режиме.
+
+    WS-пуш в фокусе намеренно узкий (restrict=key_set — только то, что
+    стримится). Но REST (/api/screener, CSV) — это «полная база», из неё
+    фронт кормит таблицу и карту рынка. Если бы он тоже резался по key_set,
+    вселенная схлопывалась бы до top-N, а при пустом/грязном key_set (сервер
+    пережил перезапуск с сохранённым фокусом, старый клиент шлёт base=0) —
+    вплоть до нуля строк: интерфейс выглядел бы мёртвым и уходил в DEMO.
+
+    Поэтому берём весь рынок целиком; дешёвые фильтры (биржа, рынок, поиск)
+    применяем сразу, чтобы сортировка не гонялась по тысячам лишних строк,
+    остальные доделает select() как обычно.
+    """
+    rows = build_rows()
+    params = F.parse_params(query)
+    if params.get("ex"):
+        wanted = {x.lower() for x in params["ex"]}
+        rows = [r for r in rows if r["ex"] in wanted or r["exl"] in params["ex"]]
+    if params.get("mt"):
+        rows = [r for r in rows if r["mt"] == params["mt"]]
+    q = params.get("q") or params.get("q_base")
+    if q:
+        rows = [r for r in rows if q in r["s"].upper() or q in (r["b"] or "").upper()]
+    return rows
+
+
 @app.get("/api/screener")
 async def api_screener(request: Request):
     """Основная выборка. Все фильтры — обычные query-параметры (см. /api/meta)."""
     qp = dict(request.query_params)
-    rows, meta = select(qp, with_densities=qp.get("dens") == "1")
+    dens = qp.get("dens") == "1"
+    rows, meta = select(qp, with_densities=dens,
+                        prefiltered=_full_market_rows(qp))
     return {"rows": rows, "meta": meta}
 
 
 @app.get("/api/screener.csv")
 async def api_screener_csv(request: Request):
-    rows, _ = select(dict(request.query_params))
+    qp = dict(request.query_params)
+    rows, _ = select(qp, prefiltered=_full_market_rows(qp))
     body = rows_to_csv(rows)
     return Response(body, media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="screener-{int(time.time())}.csv"'})
