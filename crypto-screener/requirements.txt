@@ -1,0 +1,10 @@
+ccxt>=4.5.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+# MEXC отдаёт часть WebSocket-сообщений в protobuf: без него поток сыплет
+# NotSupported("mexc requires protobuf to decode messages")
+protobuf==5.29.5
+# Необязательное ускорение: сериализация WS-пуша в 3-9 раз быстрее stdlib json.
+# Без него приложение работает идентично (fallback на json встроен в app/api.py).
+orjson>=3.9

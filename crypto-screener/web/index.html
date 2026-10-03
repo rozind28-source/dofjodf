@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crypto Screener — self-hosted</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>◧</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◧</span>
+    <div>
+      <div class="brand-name">CRYPTO SCREENER</div>
+      <div class="brand-sub">self-hosted prototype</div>
+    </div>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="grid">Графики</button>
+    <button class="tab" data-view="map">Карта рынка</button>
+    <button class="tab" data-view="screener">Скринер</button>
+    <button class="tab" data-view="densities">Плотности</button>
+    <button class="tab" data-view="alerts">Алерты <span class="badge" id="alert-badge" hidden>0</span></button>
+  </nav>
+
+  <div class="status">
+    <div class="stat" title="Инструментов в работе"><span id="st-symbols">—</span><label>монет</label></div>
+    <div class="stat updown"><span class="up" id="st-up">0</span>/<span class="dn" id="st-down">0</span><label>рост/падение</label></div>
+    <div class="stat" title="Совокупный оборот 24ч"><span id="st-vol">—</span><label>объём 24ч</label></div>
+    <div class="pill" id="mode-pill">…</div>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- ============ SIDEBAR: фильтры ============ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="side-head">
+      <input id="search" type="search" placeholder="Поиск: BTC, SOL, PEPE…" autocomplete="off">
+      <div class="side-actions">
+        <button id="btn-reset" class="mini">сброс</button>
+        <button id="btn-export" class="mini">CSV</button>
+      </div>
+    </div>
+
+    <div class="presets" id="presets"></div>
+
+    <div class="seg" id="mtseg" role="tablist" aria-label="Тип рынка">
+      <button class="seg-btn on" data-mt="swap">Фьючерсы</button>
+      <button class="seg-btn" data-mt="spot">Спот</button>
+    </div>
+    <div class="chips" id="exchips"></div>
+
+    <!-- ===== Фокус-режим: 1 биржа + 1 рынок + top-N по фильтру ===== -->
+    <div class="focus-panel" id="focus-panel">
+      <label class="focus-head" for="focus-on">
+        <input type="checkbox" id="focus-on">
+        <span class="ft">Фокус-режим</span>
+        <span class="fbadge" id="focus-badge" hidden>0</span>
+      </label>
+      <div class="focus-body" id="focus-body" hidden>
+        <div class="focus-ctl">
+          <label class="fl">монет в стриме
+            <input id="focus-limit" class="num" type="number" min="5" max="200" step="5" value="50">
+          </label>
+          <label class="fl">перепроверка, сек
+            <input id="focus-interval" class="num" type="number" min="5" max="300" step="5" value="15">
+          </label>
+        </div>
+        <label class="fcheck" for="focus-pause">
+          <input type="checkbox" id="focus-pause" checked>
+          остальные биржи на паузу
+        </label>
+        <label class="fcheck" for="focus-uniq">
+          <input type="checkbox" id="focus-uniq" checked>
+          одна монета = одна строка отбора
+        </label>
+        <div class="focus-hint" id="focus-hint"></div>
+        <div class="focus-status" id="focus-status"></div>
+      </div>
+    </div>
+
+    <div class="filter-groups" id="filters"></div>
+
+    <div class="side-foot">
+      <div class="kv"><span>обновлено</span><b id="st-updated">—</b></div>
+      <div class="kv"><span>в выборке</span><b id="st-total">—</b></div>
+      <div class="kv"><span>WS</span><b id="st-ws">—</b></div>
+      <div class="kv" id="kv-focus" hidden><span>в стриме</span><b id="st-focus">—</b></div>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+
+    <!-- Сетка графиков -->
+    <section class="view active" id="view-grid">
+      <div class="view-head">
+        <h2>Графики</h2>
+        <div class="grid-tools">
+          <div class="toolgroup" id="g-ex"></div>
+          <div class="toolgroup tf" id="g-tf"></div>
+          <div class="toolgroup size" id="g-size" title="Число ячеек сетки"></div>
+          <button class="mini" id="g-refresh" title="Обновить свечи">⟳</button>
+        </div>
+      </div>
+      <div class="charts-grid" id="charts-grid"></div>
+    </section>
+
+    <!-- Карта рынка -->
+    <section class="view" id="view-map">
+      <div class="view-head">
+        <h2>Карта рынка</h2>
+        <div class="legend">
+          <span class="lg dn3">−10%</span><span class="lg dn2">−5%</span><span class="lg dn1">−2%</span>
+          <span class="lg flat">0</span>
+          <span class="lg up1">+2%</span><span class="lg up2">+5%</span><span class="lg up3">+10%</span>
+          <span class="hint">размер плитки = объём 24ч · ⚡ = спайк</span>
+        </div>
+      </div>
+      <div class="map" id="map"></div>
+    </section>
+
+    <!-- Скринер -->
+    <section class="view" id="view-screener">
+      <div class="view-head">
+        <h2>Скринер</h2>
+        <div class="table-tools">
+          <label class="chk"><input type="checkbox" id="opt-flash" checked> подсветка сделок</label>
+          <label class="chk"><input type="checkbox" id="opt-dens"> плотности</label>
+          <select id="row-limit">
+            <option value="50">50 строк</option>
+            <option value="150" selected>150 строк</option>
+            <option value="500">500 строк</option>
+            <option value="2000">2000 строк</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="grid" id="grid">
+          <thead><tr id="grid-head"></tr></thead>
+          <tbody id="grid-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Плотности -->
+    <section class="view" id="view-densities">
+      <div class="view-head">
+        <h2>Плотности стакана</h2>
+        <div class="table-tools">
+          <label>порог $ <input id="dens-min" type="number" step="10000" value="50000" class="num"></label>
+          <select id="dens-side">
+            <option value="">обе стороны</option>
+            <option value="bid">только биды (поддержка)</option>
+            <option value="ask">только аски (сопротивление)</option>
+          </select>
+          <button id="dens-refresh" class="mini">обновить</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="grid" id="dens-table">
+          <thead><tr>
+            <th>Монета</th><th>Биржа</th><th class="r">Цена уровня</th><th class="r">От цены</th>
+            <th class="r">Объём, $</th><th class="r">Кол-во заявок</th><th>Сторона</th><th class="r">Δ24ч</th>
+          </tr></thead>
+          <tbody id="dens-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Алерты -->
+    <section class="view" id="view-alerts">
+      <div class="view-head"><h2>Алерты</h2></div>
+      <div class="alerts-wrap">
+        <form id="alert-form" class="alert-form">
+          <div class="af-row">
+            <label>Метрика <select id="af-field"></select></label>
+            <label>Условие <select id="af-op">
+              <option value="gt">&gt; больше</option><option value="gte">≥ больше или равно</option>
+              <option value="lt">&lt; меньше</option><option value="lte">≤ меньше или равно</option>
+            </select></label>
+            <label>Значение <input id="af-value" type="number" step="any" value="5" class="num"></label>
+          </div>
+          <div class="af-row">
+            <label>Биржа <select id="af-ex"><option value="">любая</option></select></label>
+            <label>Рынок <select id="af-mt"><option value="">любой</option><option value="spot">spot</option><option value="swap">swap</option></select></label>
+            <label>Символ содержит <input id="af-sym" type="text" placeholder="например USDT" class="num"></label>
+          </div>
+          <div class="af-row">
+            <label>Режим <select id="af-mode">
+              <option value="crossing">на пересечении</option>
+              <option value="while">пока условие истинно</option>
+            </select></label>
+            <label>Cooldown, сек <input id="af-cool" type="number" value="60" class="num"></label>
+            <label class="chk"><input type="checkbox" id="af-tg" checked> в Telegram</label>
+            <button type="submit" class="primary">Создать алерт</button>
+          </div>
+        </form>
+
+        <div class="alert-cols">
+          <div class="alert-col">
+            <h3>Правила <span class="muted" id="rules-count"></span></h3>
+            <div id="rules-list" class="rules"></div>
+          </div>
+          <div class="alert-col">
+            <h3>События <span class="muted" id="events-count"></span></h3>
+            <div id="events-list" class="events"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ============ DRAWER: карточка инструмента ============ -->
+<div class="drawer" id="drawer" hidden>
+  <div class="drawer-head">
+    <div>
+      <div class="d-title" id="d-title">—</div>
+      <div class="d-sub" id="d-sub">—</div>
+    </div>
+    <button class="mini" id="d-close">закрыть ✕</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<div class="conn-bar" id="conn-bar" hidden></div>
+
+<script src="chart.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
