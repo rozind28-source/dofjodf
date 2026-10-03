@@ -103,6 +103,25 @@ SELECT_CACHE_TTL = 0.5
 SELECT_CACHE_MAX = 64
 
 
+def _restrict_universe(query: dict[str, Any], restrict: set) -> bool:
+    """
+    Можно ли сужать выборку до фокус-набора без потери строк.
+
+    Смысл restrict — «не стримить лишнее»: он экономит WS-трафик, когда
+    клиент и так хочет весь рынок, а стримится только top-N той же биржи и
+    того же типа рынка. Если же в запросе нет фильтра по бирже, набор
+    focus-ключей (он всегда с одной биржи) вырезал бы из ответа ВСЕ строки
+    остальных бирж: карта рынка схлопывалась бы до чужого топ-50, а при
+    несовпадении ключей — до нуля. В таких случаях сужение запрещено:
+    отдаём полную вселенную.
+    """
+    exs = [x.strip().lower() for x in str(query.get("ex", "")).split(",") if x.strip()]
+    if len(exs) != 1:
+        return False
+    wanted = {k.split(":", 1)[0] for k in restrict}
+    return all(e.lower() in wanted for e in exs)
+
+
 def _select_cache_key(query: dict[str, Any], with_densities: bool,
                       restrict: Optional[set]) -> tuple:
     rkey = None
@@ -145,7 +164,15 @@ def select(query: dict[str, Any], with_densities: bool = False,
     rows = prefiltered if prefiltered is not None \
         else build_rows(with_densities=needs_dens)
     if restrict is not None:
-        rows = [r for r in rows if r["k"] in restrict]
+        # Сужаем только когда это безопасно: запрос про ту же биржу, что и
+        # отбор (см. _restrict_universe). Иначе restrict вырезал бы из
+        # «полной базы» все строки остальных бирж — при пустом или устаревшем
+        # key_set фронт ловил 0-37 строк, считал бэкенд мёртвым и уходил в
+        # демо-режим.
+        if _restrict_universe(query, restrict):
+            rows = [r for r in rows if r["k"] in restrict]
+        else:
+            restrict = None
     dup = F.base_universe(rows) if params.get("unique") else None
     rows = F.apply_filters(rows, params, dup)
 

@@ -55,6 +55,10 @@ BAN_TTL = 600.0          # сек: через сколько амнистиро�
 PAUSED_TICKER_REFRESH = 120.0   # сек: период опроса тикеров у биржи вне фокуса
 FOCUS_OHLCV_CONCURRENCY = 24    # параллельных запросов свечей при пересчёте отбора
 CANDLES_CACHE_MAX = 512         # записей в кэше свечей: больше — чистим (см. _prune_candles_cache)
+# Пауза между порциями фоновой подкачки 1m-свечей (_ohlcv_loop). Без неё
+# раунд из сотен klines-запросов забивал REST-очередь биржи, и /api/candles
+# отваливался по таймауту («бэкенд не ответил» → фронт уходил в демо).
+OHLCV_CHUNK_PAUSE = 1.5         # сек
 
 # --- батчевые WS-подписки -------------------------------------------------
 # Одна задача на чанк символов вместо задачи на символ: при горячем наборе
@@ -338,6 +342,14 @@ class ExchangeCollector:
         self._ticker_tasks: dict[str, asyncio.Task] = {}
         self._id_map: dict[str, str] = {}
         self._sem_ohlcv = asyncio.Semaphore(settings.ohlcv_concurrency)
+        # Троттл ФОНОВЫХ REST-запросов (подкачка 1m-свечей). Раньше фоновый
+        # цикл и интерактивные запросы графиков делили одну очередь на 6
+        # слотов: стартующий раунд из сотен klines ставил /api/candles в конец
+        # очереди, ответ не успевал за 8 c — фронт показывал «бэкенд не
+        # ответил» и уходил в демо. Теперь у срочных путей своей очереди нет
+        # (они идут напрямую), а фоновая подкачка дополнительно прорежена
+        # OHLCV_CHUNK_PAUSE и идёт через этот узкий семафор.
+        self._sem_rest = asyncio.Semaphore(max(2, settings.ohlcv_concurrency // 2))
         # Отбору по волатильности нужны свечи сразу на весь пул кандидатов
         # (до 240 штук), и первый пересчёт с общим семафором (6) занимал 9.3 c -
         # UI всё это время держал POST /api/focus открытым. Отдельный семафор
@@ -1346,17 +1358,31 @@ class ExchangeCollector:
         return self.hot[: self.cfg.top_n]
 
     async def _ohlcv_loop(self) -> None:
-        """Подкачка 1m-свечей для горячего набора → NATR и мульти-ТФ."""
+        """
+        Подкачка 1m-свечей для горячего набора → NATR и мульти-ТФ.
+
+        Порционная раздача (не gather всей пачки разом): при 150 монетах и
+        параллельности 6 это был непрерывный поток из сотен klines-запросов,
+        который забивал REST-очередь биржи — запросы графиков (/api/candles,
+        /api/grid) стояли в ней за ними и отваливались по таймауту. Между
+        порциями — пауза, чтобы срочные запросы проходили первыми; весь цикл
+        идёт через общий троттл-семафор _sem_rest.
+        """
         await asyncio.sleep(8)
         while not self._stop.is_set():
             batch = self._ohlcv_batch()
-            if not self._paused:
-                await asyncio.gather(*[self._fetch_ohlcv(s) for s in batch],
-                                     return_exceptions=True)
+            if not self._paused and batch:
+                for i in range(0, len(batch), max(1, self.settings.ohlcv_concurrency)):
+                    if self._stop.is_set() or self._paused:
+                        break
+                    chunk = batch[i:i + max(1, self.settings.ohlcv_concurrency)]
+                    await asyncio.gather(*[self._fetch_ohlcv(s) for s in chunk],
+                                         return_exceptions=True)
+                    await asyncio.sleep(OHLCV_CHUNK_PAUSE)
             await asyncio.sleep(max(60.0, self.settings.ticker_refresh * 3))
 
     async def _fetch_ohlcv(self, symbol: str) -> None:
-        async with self._sem_ohlcv:
+        async with self._sem_rest:
             try:
                 candles = await self.ex.fetch_ohlcv(symbol, "1m", limit=self.settings.ohlcv_limit)
                 STORE.bump("rest_calls")
@@ -1587,12 +1613,24 @@ class ExchangeCollector:
         """
         OHLCV для карточки инструмента. Кэш на CANDLES_TTL секунд: график
         открывают часто, а дёргать биржу на каждый запрос — путь к 429.
+
+        Свежесть кэша проверяется отдельно для каждой «поколенческой» пары
+        (tf, limit): если у символа уже есть свежие 1m-свечи на весь нужный
+        диапазон, они отдаются сразу без похода на биржу. Без этого каждый
+        второй график (после истечения 12-секундного TTL) ждал ответ медленной
+        биржи 8+ секунд и фронт уходил в «бэкенд не ответил».
         """
         cache_key = (symbol, tf, limit)
-        hit = self._candles_cache.get(cache_key)
         now = time.time()
+        hit = self._candles_cache.get(cache_key)
         if hit and now - hit[0] < CANDLES_TTL:
             return hit[1]
+        fresh = self._fresh_candles_from_store(symbol, tf, limit, now)
+        if fresh is not None:
+            # переупаковываем в кэш под этим ключом: следующий запрос в пределах
+            # CANDLES_TTL попадёт в hit и не будет трогать ни STORE, ни биржу
+            self._candles_cache[cache_key] = (now, fresh)
+            return fresh
         if symbol not in self.ex.markets:
             return []
         try:
@@ -1602,10 +1640,38 @@ class ExchangeCollector:
             log.debug("[%s] fetch_candles %s %s: %s", self.cfg.label, symbol, tf, str(e)[:140])
             STORE.bump("errors")
             return hit[1] if hit else []
-        self._candles_cache[cache_key] = (now, candles)
+        self._candles_cache[cache_key] = (time.time(), candles)
         if len(self._candles_cache) > CANDLES_CACHE_MAX:
-            self._prune_candles_cache(now)
+            self._prune_candles_cache(time.time())
         return candles
+
+    def _fresh_candles_from_store(self, symbol: str, tf: str, limit: int,
+                                  now: float) -> Optional[list]:
+        """
+        Подходящие ли 1m-свечи лежат в STORE, чтобы отдать график без биржи?
+
+        Возвращает список свечей нужного ТФ либо None (нужен REST). Условия:
+          * st.ohlcv свежая (не старше CANDLES_TTL);
+          * таймфрейм 1m и запрошенное число свечей влезает в накопленный
+            буфер (обычно это ~400 минут ≈ 6.6 часа истории);
+          * сам символ принадлежит этому коллектору (иначе возьмём чужой
+            формат объёма).
+        """
+        st = STORE.get(f"{self.cfg.id}:{symbol}")
+        if st is None or not st.ohlcv:
+            return None
+        if now - getattr(st, "ohlcv_ts", 0.0) >= CANDLES_TTL:
+            return None
+        from .metrics import TF_SECONDS, resample   # локально: снять риск цикла импортов
+        tf_sec = TF_SECONDS.get(tf)
+        if tf_sec is None:
+            return None
+        need_min = limit * 60 // max(1, tf_sec) + 2   # минут истории на нужный ТФ
+        if len(st.ohlcv) < need_min:
+            return None
+        if tf_sec == 60:
+            return [list(c) for c in st.ohlcv[-limit:]]
+        return resample(st.ohlcv, tf_sec)[-limit:]
 
     def _prune_candles_cache(self, now: float) -> None:
         """
