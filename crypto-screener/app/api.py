@@ -703,20 +703,21 @@ async def api_grid(request: Request):
     except (TypeError, ValueError):
         n, limit = 9, 200
 
-    # отбираем топ-N символов нужной биржи и рынка; build_rows() вызываем ОДИН
-    # раз — это самая дорогая операция запроса (сериализация всех символов)
+    # «Графики» = то, что сейчас показывает скринер: те же query-параметры
+    # (фильтры + сортировка + поиск), та же сортировка. Фронт присылает их
+    # копией строки запроса таблицы + sort/desc из заголовков колонок.
+    # build_rows() вызываем ОДИН раз — это самая дорогая операция (сериализация
+    # всех символов); фильтрация/сортировка по готовым строкам дешёвые.
     all_rows = build_rows()
     available = sorted({x["exl"] for x in all_rows if x["mt"] == mt})
     focus_on = focus.enabled and focus.spec.mt == mt and (
         not ex or ex in (focus.spec.ex, "") or focus.spec.ex in ("", ex))
-    if focus_on and focus.keys:
-        idx = {r["k"]: r for r in all_rows if r["mt"] == mt}
-        # порядок = порядок отбора (он уже отсортирован по фильтру пользователя)
-        rows = [idx[k] for k in focus.keys if k in idx][:n]
-        ex = ex or focus.spec.ex
-    else:
-        rows = [r for r in all_rows if (not ex or r["exl"] == ex) and r["mt"] == mt]
-        rows = F.sort_rows(rows, qp.get("sort", "vol"), True)[:n]
+    rows = [r for r in all_rows if (not ex or r["exl"] == ex) and r["mt"] == mt]
+    rows = F.apply_filters(rows, F.parse_params(qp),
+                           F.base_universe(rows) if qp.get("unique") else None)
+    rows = F.sort_rows(rows, qp.get("sort", "vol"), qp.get("desc") != "0")[:n]
+    if focus_on and not ex:
+        ex = focus.spec.ex
 
     hub = getattr(app.state, "hub", None)
 
