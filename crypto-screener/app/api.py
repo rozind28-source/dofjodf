@@ -164,15 +164,13 @@ def select(query: dict[str, Any], with_densities: bool = False,
     rows = prefiltered if prefiltered is not None \
         else build_rows(with_densities=needs_dens)
     if restrict is not None:
-        # Сужаем только когда это безопасно: запрос про ту же биржу, что и
-        # отбор (см. _restrict_universe). Иначе restrict вырезал бы из
-        # «полной базы» все строки остальных бирж — при пустом или устаревшем
-        # key_set фронт ловил 0-37 строк, считал бэкенд мёртвым и уходил в
-        # демо-режим.
-        if _restrict_universe(query, restrict):
-            rows = [r for r in rows if r["k"] in restrict]
-        else:
-            restrict = None
+        # restrict — узкий WS-пуш: отдаём только то, что реально стримится
+        # (фокус-набор всегда с одной биржи; запросы без фильтра по бирже
+        # сюда не доходят — см. ws_stream). Флаг focus_ ставим ВСЕГДА, когда
+        # restrict передан: meta может быть прочитана из кэша полной выборки
+        # (тот же query без restrict), а клиент по этому флагу решает, резать
+        # ли таблицу под фокус.
+        rows = [r for r in rows if r["k"] in restrict]
     dup = F.base_universe(rows) if params.get("unique") else None
     rows = F.apply_filters(rows, params, dup)
 
@@ -616,8 +614,13 @@ def _full_market_rows(query: dict[str, Any]) -> list[dict]:
     rows = build_rows()
     params = F.parse_params(query)
     if params.get("ex"):
+        # то же регистронезависимое сравнение, что и в filters._passes:
+        # UI шлёт лейбл («Binance»), в строках id («binanceusdm») — иначе
+        # предфильтр вырезал всю вселенную и REST отдавал только top-N фокуса
         wanted = {x.lower() for x in params["ex"]}
-        rows = [r for r in rows if r["ex"] in wanted or r["exl"] in params["ex"]]
+        rows = [r for r in rows
+                if (r["ex"] or "").lower() in wanted
+                or (r["exl"] or "").lower() in wanted]
     if params.get("mt"):
         rows = [r for r in rows if r["mt"] == params["mt"]]
     q = params.get("q") or params.get("q_base")

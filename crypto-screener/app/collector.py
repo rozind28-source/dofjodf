@@ -1002,9 +1002,9 @@ class ExchangeCollector:
                 b["syms"] = []
                 b["gen"] += 1
             if self._batch_on(kind):
-                self._sync_batch(kind, want)
+                await self._sync_batch(kind, want)
 
-    def _sync_batch(self, kind: str, want: list[str]) -> None:
+    async def _sync_batch(self, kind: str, want: list[str]) -> None:
         """
         Список изменился → перезапускаем задачи чанков; отписка — фоново.
 
@@ -1020,8 +1020,11 @@ class ExchangeCollector:
         if pu is not None and not pu.done():
             try:
                 await asyncio.wait_for(asyncio.shield(pu), timeout=5.0)
-            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            except asyncio.TimeoutError:
                 pass
+            except Exception as e:  # noqa: BLE001
+                log.debug("[%s] ожидание отписки: %s: %s", self.cfg.label,
+                          type(e).__name__, str(e)[:120])
         alive = [t for t in b["tasks"] if not t.done()]
         rebuild = b.pop("rebuild", False)
         if want == b["syms"] and not rebuild and (alive or not want):
