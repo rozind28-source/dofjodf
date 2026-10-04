@@ -1382,7 +1382,13 @@ async function loadGrid() {
   // ячейки по тем же sort/desc; в DEMO и как страховка при сбое сортируем
   // сами — так сетка и таблица всегда показывают один и тот же список.
   if (d && Array.isArray(d.cells)) {
-    d.cells = d.cells.slice().sort(gridSortCmp()).slice(0, g.n);
+    // В live-режиме НЕ пересортировываем: сервер уже выдал ячейки в порядке
+    // скринера с детерминированным вторичным ключом. Клиентская сортировка
+    // без tie-breaker'а при равных значениях (u fresh монет natr/tr = 0)
+    // тасовала плитки местами между циклами — визуально «графики меняются
+    // и пропадают после нового отбора». Срез по n оставляем на всякий случай.
+    if (!state.demo) d.cells = d.cells.slice(0, g.n);
+    else d.cells = d.cells.slice().sort(gridSortCmp()).slice(0, g.n);
     if (state.focus.enabled && (!state.focus.server || failed)) {
       state.focus.count = d.cells.length;
       state.focus.keys = d.cells.map((c) => c.k);
@@ -1390,7 +1396,26 @@ async function loadGrid() {
   }
   if (state.focus.enabled && d && d.focus) renderFocus(d.focus);
   g.lastFailed = failed;
-  g.cells = d.cells || [];
+  const newCells = d.cells || [];
+  // «Графики пропадают после нового отбора»: состав сетки меняется каждые
+  // ~15 с, и если очередная волна /api/grid пришла без свечей (биржа не
+  // успела ответить, REST-очередь занята), перерисовка стирала живые графики
+  // и показывала «нет свечей». Держим прежние ячейки там, где новых свечей
+  // нет, а старые были — плитка переживёт промах одного цикла; как только
+  // бэкенд догреет свечи, данные обновятся.
+  if (g.cells && g.cells.length) {
+    const prevByKey = new Map(g.cells.map((c) => [c.k, c]));
+    for (let i = 0; i < newCells.length; i++) {
+      const c = newCells[i];
+      const prev = prevByKey.get(c.k);
+      if ((!c.candles || !c.candles.length) && prev &&
+          prev.candles && prev.candles.length) {
+        newCells[i] = Object.assign({}, c, { candles: prev.candles,
+                                             candles_ok: true });
+      }
+    }
+  }
+  g.cells = newCells;
   g.tfSeconds = d.tf_seconds || TF_SEC[g.tf] || 300;
   renderGridCells();
   const head = $("#view-grid .view-head h2");

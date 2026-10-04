@@ -777,7 +777,21 @@ async def api_grid(request: Request):
     rows = [r for r in all_rows if (not ex or r["exl"] == ex) and r["mt"] == mt]
     rows = F.apply_filters(rows, F.parse_params(qp),
                            F.base_universe(rows) if qp.get("unique") else None)
-    rows = F.sort_rows(rows, qp.get("sort", "vol"), qp.get("desc") != "0")[:n]
+    sort_key = qp.get("sort", "vol")
+    if sort_key not in F.SORT_FIELDS:
+        sort_key = "vol"
+    desc = qp.get("desc") != "0"
+    # Порядок плиток должен СОВПАДАТЬ с таблицей скринера — в т.ч. при
+    # одинаковых значениях сортируемого поля (у свежих монет natr/tr часто
+    # равны нулю). Поэтому сортируем по той же паре (ключ, k), что и фронт
+    # в gridSortCmp(): без второго ключа sorted() оставил бы «ничьюные»
+    # строки в произвольном порядке, сетка пережил бы перестановку при
+    # каждом новом отборе, а фронт, пересортировывая stable-сортировкой,
+    # путал ячейки местами → плитки выглядели «пропавшими/не теми».
+    rows.sort(key=lambda r: ((r.get(sort_key) is None,
+                              -(r.get(sort_key) or 0) if desc
+                              else (r.get(sort_key) or 0), r["k"])))
+    rows = rows[:n]
     if focus_on and not ex:
         ex = focus.spec.ex
 
