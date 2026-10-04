@@ -816,7 +816,7 @@ async def api_grid(request: Request):
             "candles_ok": bool(candles),
         }
 
-    if hub is not None:
+    if hub is not None and rows:
         # Кэш всей сетки на GRID_TTL + фоновый прогрев 1m-свечей (collector.
         # get_grid/warm_for_grid): раньше каждая плитка каждые 15 с тянула
         # klines через троттл-семафор биржи — при медленных биржах очередь

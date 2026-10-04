@@ -2067,6 +2067,9 @@ class CollectorHub:
         self._grids: dict[tuple, tuple[float, list]] = {}
         # WS kline-подписки сетки: collector id → {tf: набор символов}
         self._grid_subs: dict[str, dict[str, set]] = {}
+        # незавершённые подписки по коллектору: не даём двум волнам /api/grid
+        # одновременно дёргать watch/unwatch одного и того же стрима
+        self._grid_sub_active: dict[str, int] = {}
 
     async def _resubscribe_grid(self, col, syms: list[str], tf: str) -> None:
         """
@@ -2075,17 +2078,34 @@ class CollectorHub:
         Повторный вызов с тем же составом — no-op; изменился набор или ТФ —
         старые потоки снимаются внутри watch_candles. Биржи без WS-kline
         (ccxt пройдёт в NotSupported) тихо остаются на REST-прогреве.
+
+        «Графики пропадают при новом отборе» усугублялось гонкой: каждые
+        ~15 с фронт звал /api/grid, каждый вызов создавал задачу подписки,
+        а медленный watch_candles (отписка от старых пар + подписка на новые)
+        выполнялся параллельно с себе подобными — ccxt.pro снимал подписку
+        только что созданного потока, и плитки оставались без свечей. Теперь
+        одновременна только одна подписка на коллектор, а устаревшая волна
+        просто выходит (её состав уже не актуален).
         """
         want = set(syms)
         cur = self._grid_subs.setdefault(col.cfg.id, {})
+        active = self._grid_sub_active.get(col.cfg.id, 0)
+        if active:
+            # другая подписка этого коллектора ещё выполняется — не лезем
+            # вторым потоком в те же стримы; дождёмся её на следующем цикле
+            return
         if cur.get(tf) == want and all(not t.done() for t in col._candle_tasks.values()):
             return
         cur[tf] = want
+        self._grid_sub_active[col.cfg.id] = active + 1
         try:
             await col.watch_candles(sorted(want), tf, 0)
         except Exception as e:  # noqa: BLE001
             log.debug("[сетка] ws-kline %s: %s: %s", col.cfg.label,
                       type(e).__name__, str(e)[:140])
+        finally:
+            self._grid_sub_active[col.cfg.id] = max(
+                0, self._grid_sub_active.get(col.cfg.id, 1) - 1)
 
     async def start(self) -> None:
         if not self.settings.exchanges:
@@ -2181,18 +2201,25 @@ class CollectorHub:
             log.warning("сетка: не найдены коллекторы для %s (доступны: %s)",
                         ", ".join(sorted(unresolved)),
                         ", ".join(f"{c.cfg.id}/{c.cfg.market}" for c in self.collectors))
-        # WS kline-поток под текущий набор плиток (last-writer-wins внутри
-        # watch_candles). Именно его отсутствие приводило к «графики есть при
-        # выборе биржи, а после нового отбора пропадают»: состав сетки
-        # меняется каждые ~15 с, старые кандидаты переставали стримиться,
-        # их 1m-буфер протухал (CANDLES_TTL), и новые плитки уходили в
-        # REST-очередь медленной биржи, где большинство отваливалось по
-        # таймауту → «нет свечей». Метод async — гоняем через create_task,
-        # чтобы не блокировать выдачу ячеек на подписку.
+        # WS kline-поток под текущий набор плиток. Состав сетки меняется
+        # каждые ~15 с; метод async, но раньше он запускался фоновой задачей
+        # НА КАЖДЫЙ вызов get_grid — параллельные волны подписок снимали
+        # стримы друг у друга (см. _resubscribe_grid) и плитки рождались
+        # без свечей. Теперь одновременна только одна подписка на коллектор,
+        # устаревшие волны отбрасываются. Запуск через create_task +
+        # wait_for(shield(t), 0): если в этом цикле событий уже есть I/O
+        # (запросы к биржам), таймаут 0 мгновенно вернёт TimeoutError —
+        # выдача ячеек не блокируется подпиской; если планировщик пуст
+        # (тесты/демо), подписка успевает зарегистрироваться до gather.
         for c, syms in by_col.items():
-            _GRID_WARM_TASKS.add(asyncio.create_task(
-                self._resubscribe_grid(c, syms, tf),
-                name=f"gridsub:{c.cfg.id}"))
+            t = asyncio.create_task(self._resubscribe_grid(c, syms, tf),
+                                    name=f"gridsub:{c.cfg.id}")
+            _GRID_WARM_TASKS.add(t)
+            t.add_done_callback(_GRID_WARM_TASKS.discard)
+            try:
+                await asyncio.wait_for(asyncio.shield(t), timeout=0)
+            except asyncio.TimeoutError:
+                pass
         # фон: добираем 1m-свечи недостающим символам (см. warm_for_grid)
         for c, syms in by_col.items():
             self._grid_warm(c, syms, tf, limit)
