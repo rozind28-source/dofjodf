@@ -164,8 +164,15 @@ def _passes(row: dict, p: dict[str, Any], dup_bases: Optional[dict[str, set[str]
             return False
 
     # срезы
-    if p.get("ex") and row.get("exl") not in p["ex"] and row.get("ex") not in p["ex"]:
-        return False
+    # биржа: сравниваем без регистра — UI шлёт лейбл («Binance»), а в строках
+    # лежит id в нижнем регистре («binanceusdm»); раньше из-за этого фильтр
+    # «ex=Binance» вырезал ВСЕ строки (сетка графиков рождалась пустой)
+    if p.get("ex"):
+        exl = (row.get("exl") or "").lower()
+        eid = (row.get("ex") or "").lower()
+        wanted = {str(x).lower() for x in p["ex"]}
+        if exl not in wanted and eid not in wanted:
+            return False
     if p.get("mt") and row.get("mt") != p["mt"]:
         return False
     if p.get("q"):

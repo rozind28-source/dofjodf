@@ -1832,6 +1832,12 @@ def _find_last(tickers: dict, base: str) -> Optional[float]:
 # --------------------------------------------------------------------------
 # Оркестрация всех бирж
 # --------------------------------------------------------------------------
+# Оркестратор хранит long-lived задачи бирж в списке (см. CollectorHub.tasks),
+# а разовые фоновые прогревы сетки — здесь, во множестве: у list нет .discard(),
+# и короткие таски не должны попадать в gather() остановки хаба.
+_GRID_WARM_TASKS: set[asyncio.Task] = set()
+
+
 class CollectorHub:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -1939,8 +1945,12 @@ class CollectorHub:
         """Разовая фоновая задача прогрева свечей сетки (не ждём ответа)."""
         t = asyncio.create_task(col.warm_for_grid(syms, tf, limit),
                                 name=f"gridwarm:{col.cfg.id}")
-        self.tasks.append(t)
-        t.add_done_callback(self.tasks.discard)
+        # self.tasks — список LONG-lived задач бирж (см. __init__/start);
+        # у list нет .discard(), и сам прогрев не должен попадать в gather
+        # остановки. Храним слабую ссылку, чтобы таск не собирались GC-раньше
+        # времени: done-колбэк убирает его из «держателя».
+        _GRID_WARM_TASKS.add(t)
+        t.add_done_callback(_GRID_WARM_TASKS.discard)
 
     async def stop(self) -> None:
         for c in self.collectors:
