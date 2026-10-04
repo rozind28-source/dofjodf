@@ -1080,6 +1080,14 @@ class ExchangeCollector:
         STORE.bump("errors")
         b = self._batch[kind]
         low = str(e).lower()
+        if "already subscribed" in low:
+            # ccxt потерял состояние гонки пересборки подписок (ротация фокуса
+            # сняла и тут же подписала тот же топик). Для bybit это штатная
+            # ситуация «подписка уже живёт»: ждём, пока поток переживёт
+            # пересборку; счётчик отказов не трогаем, чтобы не хоронить батч.
+            log.debug("[%s] %s batch: already subscribed — ждём пересборку",
+                      self.cfg.label, kind)
+            return 0, first_fail, False
         if b["chunk"] > 10 and any(h in low for h in self._SIZE_ERROR_HINTS):
             # биржа отвергла размер списка (реальный случай: bybit spot —
             # «args size >10»): режем чанк вдвое и пересобираем подписки
@@ -1150,6 +1158,12 @@ class ExchangeCollector:
             except (ccxt.NetworkError, ccxtpro.NetworkError):
                 await asyncio.sleep(1)        # транзиентная — счётчик не трогаем
             except Exception as e:  # noqa: BLE001
+                if "already subscribed" in str(e).lower():
+                    # подписка уже живёт на этом же соединении (гонка пересборки
+                    # при ротации фокуса) — ждём, пока ccxt сам разберётся;
+                    # иначе future с ошибкой «висит» и сыпется в лог asyncio
+                    await asyncio.sleep(2.0)
+                    continue
                 fails, first_fail, dead = self._batch_fail("book", e, fails, first_fail)
                 if dead:
                     return
@@ -1194,6 +1208,9 @@ class ExchangeCollector:
             except (ccxt.NetworkError, ccxtpro.NetworkError):
                 await asyncio.sleep(1)
             except Exception as e:  # noqa: BLE001
+                if "already subscribed" in str(e).lower():
+                    await asyncio.sleep(2.0)   # гонка пересборки — см. _book_stream_batch
+                    continue
                 fails, first_fail, dead = self._batch_fail("trades", e, fails, first_fail)
                 if dead:
                     return
@@ -1234,6 +1251,9 @@ class ExchangeCollector:
             except (ccxt.NetworkError, ccxtpro.NetworkError):
                 await asyncio.sleep(1)
             except Exception as e:  # noqa: BLE001
+                if "already subscribed" in str(e).lower():
+                    await asyncio.sleep(2.0)   # гонка пересборки — см. _book_stream_batch
+                    continue
                 fails, first_fail, dead = self._batch_fail("tickers", e, fails, first_fail)
                 if dead:
                     return
@@ -1856,21 +1876,29 @@ class CollectorHub:
             self.tasks.append(asyncio.create_task(c.run(), name=f"hub:{cfg.id}"))
         log.info("collector hub started: %s", ", ".join(c.cfg.label for c in self.collectors))
 
-    def find(self, exchange_id: str, market_type: str) -> Optional[ExchangeCollector]:
+    def find(self, exchange_id: str, market_type: str = "") -> Optional[ExchangeCollector]:
         """
         Коллектор по id+рынок или по лейблу+рынок.
 
         Лейбл теперь общий для спота и свопа одной биржи («Binance»), поэтому
-        поиск по одному лейблу неоднозначен — рынок обязателен.
+        поиск по одному лейблу неоднозначен — рынок желателен. Если рынок пуст
+        ("") — берём первого коллектора этой биржи (в сетке графиков тип рынка
+        уже задан фильтром строк). Сравнение регистронезависимое: фронт шлёт
+        лейблы вида «Aster», «MEXC», а cfg.id — это ccxt-идентификаторы в
+        нижнем регистре («aster», «mexc»).
         """
-        for c in self.collectors:
-            if c.cfg.market != market_type:
-                continue
-            if c.cfg.id == exchange_id or c.cfg.label == exchange_id:
-                return c
+        want = (exchange_id or "").lower()
+        if not want:
+            return None
+        if market_type:
+            for c in self.collectors:
+                if c.cfg.market != market_type:
+                    continue
+                if c.cfg.id.lower() == want or c.cfg.label.lower() == want:
+                    return c
         # запасной вариант: рынок не совпал (биржа подключена только одним рынком)
         for c in self.collectors:
-            if c.cfg.id == exchange_id or c.cfg.label == exchange_id:
+            if c.cfg.id.lower() == want or c.cfg.label.lower() == want:
                 return c
         return None
 
@@ -1908,26 +1936,49 @@ class CollectorHub:
         cells = []
         by_col: dict = {}
         routes: list = []
+        unresolved: set[str] = set()
         for row in rows:
-            c = self.find(row[0], "")
+            # row может быть кортежем (ex, symbol) — тогда market_type берём
+            # из ключа символа ("mexc:BTC/USDT:USDT" -> swap), либо словарём
+            # строки скринера.
+            if isinstance(row, dict):
+                ex_id, sym = row.get("ex") or row.get("exl") or "", row.get("s") or ""
+                mt_hint = "swap" if ":USDT:USDT" in str(row.get("k", "")) \
+                    else ("spot" if row.get("mt") == "spot" else "")
+            else:
+                ex_id, sym = row[0], row[1]
+                mt_hint = "swap" if "/USDT:USDT" in sym or ":USDT:USDT" in sym else ""
+            c = self.find(ex_id, mt_hint)
+            if c is None:
+                c = self.find(ex_id, "")
+            if c is None:
+                unresolved.add(str(ex_id))
             routes.append(c)
             if c is not None:
-                by_col.setdefault(c, []).append(row[1])
+                by_col.setdefault(c, []).append(sym)
+        if unresolved:
+            log.warning("сетка: не найдены коллекторы для %s (доступны: %s)",
+                        ", ".join(sorted(unresolved)),
+                        ", ".join(f"{c.cfg.id}/{c.cfg.market}" for c in self.collectors))
         # фон: добираем 1m-свечи недостающим символам (см. warm_for_grid)
         for c, syms in by_col.items():
             self._grid_warm(c, syms, tf, limit)
         async def one(row: tuple, c) -> list:
             if c is None:
                 return []
+            sym = row["s"] if isinstance(row, dict) else row[1]
             try:
                 return await asyncio.wait_for(
-                    c.fetch_candles(row[1], tf, limit),
+                    c.fetch_candles(sym, tf, limit),
                     timeout=CANDLES_FETCH_TIMEOUT)
             except asyncio.TimeoutError:
                 log.warning("свечи сетки %s %s: таймаут %.0f c — отдаём resample/пустоту",
-                            row[0], row[1], CANDLES_FETCH_TIMEOUT)
+                            row[0] if not isinstance(row, dict) else row.get("ex"),
+                            sym, CANDLES_FETCH_TIMEOUT)
                 return []
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                log.warning("свечи сетки %s: %s: %s",
+                            sym, type(e).__name__, str(e)[:200])
                 return []
 
         # параллельно по всем ячейкам: при последовательном опросе сетка из

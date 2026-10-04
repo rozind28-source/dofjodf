@@ -453,6 +453,65 @@ async def _loop_lag_monitor() -> None:
 app = FastAPI(title="Crypto Screener (self-hosted)", version="0.1.0", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def _log_errors(request: Request, call_next):
+    """
+    Единая точка логирования 5xx.
+
+    Без неё браузер видит только «Failed to load resource: 500», а настоящая
+    причина живёт в простыне uvicorn. Пишем одной строкой путь запроса + тип и
+    текст исключения, и отдаём понятный JSON — так видно в логе, какой именно
+    эндпоинт падает и почему.
+    """
+    try:
+        return await call_next(request)
+    except Exception as e:  # noqa: BLE001
+        log.exception("HTTP 500 %s %s: %s: %s", request.method,
+                      request.url.path, type(e).__name__, str(e)[:300])
+        return JSONResponse({"error": f"{type(e).__name__}: {str(e)[:300]}",
+                             "path": request.url.path}, status_code=500)
+
+
+# --------------------------------------------------------------------------
+# REST: диагностика состояния приложения для вкладки «Логи»
+# --------------------------------------------------------------------------
+_LOG_BUF_SIZE = 500
+_LOG_BUFFER: list[dict] = []
+
+
+class _MemoryLogHandler(logging.Handler):
+    """Хранит последние N записей лога в памяти для /api/logs."""
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
+        try:
+            _LOG_BUFFER.append({
+                "t": time.strftime("%H:%M:%S", time.localtime(record.created)),
+                "lvl": record.levelname,
+                "src": record.name,
+                "msg": record.getMessage()[:500],
+            })
+            if len(_LOG_BUFFER) > _LOG_BUF_SIZE:
+                del _LOG_BUFFER[:-_LOG_BUF_SIZE]
+        except Exception:  # noqa: BLE001 - лог-хендлер не должен ронять приложение
+            pass
+
+
+_mem_handler = _MemoryLogHandler()
+_mem_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(_mem_handler)
+
+
+@app.get("/api/logs")
+async def api_logs(since: int = 0, lvl: str = ""):
+    """Последние сообщения лога (для встроенной панели диагностики)."""
+    out = _LOG_BUFFER[since:] if since else list(_LOG_BUFFER)
+    if lvl:
+        want = lvl.upper()
+        out = [x for x in out if x["lvl"] == want or
+               (want == "WARN" and x["lvl"] == "WARNING")]
+    return {"total": len(_LOG_BUFFER), "logs": out}
+
+
 # --------------------------------------------------------------------------
 # REST: данные
 # --------------------------------------------------------------------------
@@ -746,8 +805,16 @@ async def api_grid(request: Request):
         # Тикерные поля (цена/изменение) внутри кэша устаревают на десятки
         # секунд — их фронт освежает из WS-потока (gridTick + строки скринера).
         gkey = (tuple(r["k"] for r in rows), ex, mt, tf, n, limit)
-        cells = await hub.get_grid(gkey, [(r["ex"], r["s"]) for r in rows],
-                                   tf, limit, build_cell)
+        try:
+            cells = await hub.get_grid(gkey, [(r["ex"], r["s"]) for r in rows],
+                                       tf, limit, build_cell)
+        except Exception as e:  # noqa: BLE001
+            # Сетка не должна ронять запрос: без свечей отдаём строки скринера
+            # (плитки будут с ценой/объёмом, но пустым графиком до следующего
+            # цикла прогрева). Причина падения — в лог одной строкой.
+            log.exception("grid: hub.get_grid упал (%s: %s) — отдаём ячейки без свечей",
+                          type(e).__name__, str(e)[:200])
+            cells = [build_cell(r, []) for r in rows]
     else:
         cells = [build_cell(r, []) for r in rows]
     return {"cells": cells, "tf": tf, "tf_seconds": TF_SECONDS[tf], "mt": mt,
