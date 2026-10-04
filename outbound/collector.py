@@ -343,6 +343,8 @@ class ExchangeCollector:
         self._book_tasks: dict[str, asyncio.Task] = {}
         self._trade_tasks: dict[str, asyncio.Task] = {}
         self._ticker_tasks: dict[str, asyncio.Task] = {}
+        # WS-подписки на kline для сетки графиков (см. watch_candles)
+        self._candle_tasks: dict[str, asyncio.Task] = {}
         self._id_map: dict[str, str] = {}
         self._sem_ohlcv = asyncio.Semaphore(settings.ohlcv_concurrency)
         # Троттл ФОНОВЫХ REST-запросов (подкачка 1m-свечей). Раньше фоновый
@@ -657,6 +659,13 @@ class ExchangeCollector:
         await self._drop_single_subscriptions("book", books)
         await self._drop_single_subscriptions("trades", trades)
         await self._drop_single_subscriptions("tickers", tickers)
+        # kline-потоки сетки графиков — те же правила пересборки подписок
+        candles = sorted(self._candle_tasks)
+        for t in list(self._candle_tasks.values()):
+            t.cancel()
+        self._candle_tasks.clear()
+        if candles:
+            await self._drop_single_subscriptions("candles", candles)
 
     async def ensure_ohlcv(self, symbols: list[str], limit: int = 400) -> int:
         """
@@ -954,6 +963,19 @@ class ExchangeCollector:
         Сначала ждём завершения всех un_watch_* по символам — иначе отписка
         долетит до биржи ПОСЛЕ повторной подписки и снимет уже новый поток.
         """
+        if kind == "candles":
+            # kline-подписки сетки графиков живут отдельным dict и своим
+            # методом un_watch_ohlcv_for_symbols ([[sym, tf], ...])
+            pairs = [[s, getattr(self, "_candle_tf", "1m")] for s in symbols]
+            if pairs and hasattr(self.ex, "un_watch_ohlcv_for_symbols"):
+                try:
+                    await self.ex.un_watch_ohlcv_for_symbols(pairs)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    log.debug("[%s] drop candles %d: %s: %s", self.cfg.label,
+                              len(pairs), type(e).__name__, str(e)[:120])
+            return
         coros = [self._unwatch(kind, s) for s in symbols]
         if coros:
             await asyncio.gather(*coros, return_exceptions=True)
@@ -1713,32 +1735,134 @@ class ExchangeCollector:
 
     async def warm_for_grid(self, symbols: list[str], tf: str, limit: int) -> None:
         """
-        Подкачка 1m-свечей символам сетки графиков (/api/grid).
+        Подкачка свечей символам сетки графиков (/api/grid).
 
-        Пока у монеты нет буфера 1m-свечей, каждый запрос сетки обязан тянуть
-        её запрошенный ТФ через REST биржи; при n=9..25 ячеек это очередь из
-        быстрых, но дорогих ответов — часть ячеек отваливается по таймауту и
-        плитки остаются пустыми («график периодически пропадает»). Фоновый
-        _ohlcv_loop обновляет только горячий набор, а пул кандидатов фокуса
-        вообще никем не подкачивался между пересчётами отбора.
+        Ключевое: прогреваем НЕ только 1m-буфер, а сразу запрошенный ТФ —
+        он кладётся в _candles_cache с TTL=GRID_TTL, и get_grid отдаёт
+        плитки из кэша без похода на биржу. Раньше грелся лишь 1m-буфер,
+        но у свежих кандидатов нового отбора он ПУСТОЙ (монета только что
+        попала в сетку), resample из STORE невозможен, и каждая такая
+        плитка уходила в REST-очередь с таймаутом 8 c → «графики есть при
+        выборе биржи, а после нового отбора пропадают».
 
-        Здесь тот же фоновый цикл, но адресно: символам текущей сетки, с
-        увеличенным TTL (GRID_TTL) — редкие заходы в сетку не превращаются в
-        шторм REST-запросов. Отдельных задач не создаём: разовые gather по
-        чанкам идут внутри уже существующего потока событий.
+        Очередь прогрева ограничена (не больше ohlcv_concurrency*2 за проход)
+        и идёт через _sem_rest — медленная биржа не захлёбывается.
         """
-        todo = []
         now = time.time()
+        todo = []
+        ck_tail = (tf, limit)
         for sym in symbols:
+            cached = self._candles_cache.get((sym,) + ck_tail)
+            if cached and now - cached[0] < GRID_TTL:
+                continue                       # сетка этого ТФ уже прогрета
             st = self._state(sym)
-            if not st.ohlcv or now - getattr(st, "ohlcv_ts", 0.0) >= GRID_TTL:
-                todo.append(sym)
+            if st.ohlcv and now - getattr(st, "ohlcv_ts", 0.0) < CANDLES_TTL \
+                    and self._fresh_candles_from_store(sym, tf, limit, now) is not None:
+                continue                       # resample из свежего 1m закроет нужду
+            todo.append(sym)
         if not todo:
             return
         chunk = max(1, self.settings.ohlcv_concurrency)
-        await asyncio.gather(*[self._fetch_ohlcv(s, force=True, ttl=GRID_TTL)
+        await asyncio.gather(*[self._warm_tf(s, tf, limit)
                                for s in todo[:chunk * 2]],
                              return_exceptions=True)
+
+    async def _warm_tf(self, symbol: str, tf: str, limit: int) -> None:
+        """Разовое REST-получение свечей нужного ТФ в _candles_cache (GRID_TTL)."""
+        if symbol not in self.ex.markets:
+            return
+        async with self._sem_rest:
+            try:
+                candles = await self.ex.fetch_ohlcv(symbol, tf, limit=limit)
+                STORE.bump("rest_calls")
+            except Exception as e:  # noqa: BLE001
+                STORE.bump("errors")
+                log.debug("[%s] grid-warm %s %s: %s: %s", self.cfg.label, symbol,
+                          tf, type(e).__name__, str(e)[:140])
+                return
+            if candles:
+                self._candles_cache[(symbol, tf, limit)] = (time.time(), candles)
+                # параллельно наполняем 1m-буфер для будущих resample
+                if not self._state(symbol).ohlcv:
+                    asyncio.create_task(self._fetch_ohlcv(symbol, force=True,
+                                                          ttl=GRID_TTL),
+                                        name=f"{self.cfg.id}:warm1m:{symbol}")
+
+    async def watch_candles(self, symbols: list[str], tf: str, limit: int) -> None:
+        """
+        WS-подписка на kline для сетки графиков (там, где ccxt.pro её умеет).
+
+        Ключевое отличие от REST-прогрева: свечи приходят САМИ, st.ohlcv_ts
+        обновляется на каждый тик — и grid-cache после истечения GRID_TTL
+        пересобирается мгновенно из свежих данных без единого запроса к бирже.
+        Именно поэтому «графики есть при выборе биржи, а через минуту
+        пропадают»: при паузе фокуса стримы биржи закрываются, 1m-буфер
+        перестаёт пополняться, CANDLES_TTL (12 c) истекает, и каждая плитка
+        уходит в REST-очередь медленной биржи, где большинство ячеек
+        отваливается по таймауту → «нет свечей».
+
+        Поток живёт как обычная поточечная задача (_candle_tasks): его снимают
+        pause/resume/_close_streams вместе с остальными подписками, ротация
+        состава — по принципу last-writer-wins (повторный вызов заменяет набор).
+        """
+        if self._stop.is_set():
+            return
+        # набор плиток изменился: снимаем потоки символов, которых больше нет
+        # в запросе (у старых топиков освобождаем messageHashes ccxt — иначе
+        # следующая подписка тем же символом получит «already subscribed»)
+        want = set(symbols)
+        for sym in [s for s in self._candle_tasks if s not in want]:
+            t = self._candle_tasks.pop(sym)
+            t.cancel()
+            await self._drop_single_subscriptions("candles", [sym])
+        self._candle_tf = tf
+        for sym in symbols:
+            if sym in self._candle_tasks or sym not in self.ex.markets:
+                continue
+            t = asyncio.create_task(self._candle_stream(sym, tf),
+                                    name=f"{self.cfg.id}:candle:{sym}")
+            self._candle_tasks[sym] = t
+            t.add_done_callback(lambda x, s=sym: self._candle_tasks.pop(s, None)
+                                if self._candle_tasks.get(s) is x else None)
+
+    async def _candle_stream(self, symbol: str, tf: str) -> None:
+        while not self._stop.is_set():
+            if self._paused:
+                await asyncio.sleep(2.0)   # пауза фокуса: ждём resume, не лезем на биржу
+                continue
+            try:
+                ohlcv = await self.ex.watch_ohlcv_for_symbols([[symbol, tf]])
+                candles = None
+                if isinstance(ohlcv, dict):
+                    v = ohlcv.get(symbol)
+                    if isinstance(v, dict):
+                        candles = v.get("info") or v.get("candles") or v.get("ohlcv")
+                    elif isinstance(v, list):
+                        candles = v
+                elif isinstance(ohlcv, list) and ohlcv:
+                    first = ohlcv[0]
+                    candles = first.get("candles") if isinstance(first, dict) else None
+                if candles:
+                    self._state(symbol).apply_ohlcv(candles)
+                    STORE.bump("ws_messages")
+            except asyncio.CancelledError:
+                return
+            except (ccxt.BadSymbol, ccxtpro.BadSymbol):
+                self._candle_tasks.pop(symbol, None)
+                return
+            except (ccxt.NotSupported, ccxt.BadRequest, ccxt.ArgumentsRequired):
+                # биржа не отдаёт kline по WS — тихо выходим, остаётся REST-путь
+                self._candle_tasks.pop(symbol, None)
+                return
+            except (ccxt.NetworkError, ccxtpro.NetworkError):
+                await asyncio.sleep(1)
+            except Exception as e:  # noqa: BLE001
+                if "already subscribed" in str(e).lower():
+                    await asyncio.sleep(2.0)   # гонка пересборки — см. _book_stream_batch
+                    continue
+                log.debug("[%s] candle %s: %s: %s", self.cfg.label, symbol,
+                          type(e).__name__, str(e)[:140])
+                await asyncio.sleep(2)
 
     # ------------------------------------------------------------------
     # Свечи для графиков (по требованию, с кэшем)
@@ -1941,6 +2065,27 @@ class CollectorHub:
         self.tasks: list[asyncio.Task] = []
         # кэш готовых сеток /api/grid: key → (ts, cells); см. get_grid()
         self._grids: dict[tuple, tuple[float, list]] = {}
+        # WS kline-подписки сетки: collector id → {tf: набор символов}
+        self._grid_subs: dict[str, dict[str, set]] = {}
+
+    async def _resubscribe_grid(self, col, syms: list[str], tf: str) -> None:
+        """
+        Пересобрать WS kline-поток биржи под текущий набор плиток сетки.
+
+        Повторный вызов с тем же составом — no-op; изменился набор или ТФ —
+        старые потоки снимаются внутри watch_candles. Биржи без WS-kline
+        (ccxt пройдёт в NotSupported) тихо остаются на REST-прогреве.
+        """
+        want = set(syms)
+        cur = self._grid_subs.setdefault(col.cfg.id, {})
+        if cur.get(tf) == want and all(not t.done() for t in col._candle_tasks.values()):
+            return
+        cur[tf] = want
+        try:
+            await col.watch_candles(sorted(want), tf, 0)
+        except Exception as e:  # noqa: BLE001
+            log.debug("[сетка] ws-kline %s: %s: %s", col.cfg.label,
+                      type(e).__name__, str(e)[:140])
 
     async def start(self) -> None:
         if not self.settings.exchanges:
@@ -2036,6 +2181,18 @@ class CollectorHub:
             log.warning("сетка: не найдены коллекторы для %s (доступны: %s)",
                         ", ".join(sorted(unresolved)),
                         ", ".join(f"{c.cfg.id}/{c.cfg.market}" for c in self.collectors))
+        # WS kline-поток под текущий набор плиток (last-writer-wins внутри
+        # watch_candles). Именно его отсутствие приводило к «графики есть при
+        # выборе биржи, а после нового отбора пропадают»: состав сетки
+        # меняется каждые ~15 с, старые кандидаты переставали стримиться,
+        # их 1m-буфер протухал (CANDLES_TTL), и новые плитки уходили в
+        # REST-очередь медленной биржи, где большинство отваливалось по
+        # таймауту → «нет свечей». Метод async — гоняем через create_task,
+        # чтобы не блокировать выдачу ячеек на подписку.
+        for c, syms in by_col.items():
+            _GRID_WARM_TASKS.add(asyncio.create_task(
+                self._resubscribe_grid(c, syms, tf),
+                name=f"gridsub:{c.cfg.id}"))
         # фон: добираем 1m-свечи недостающим символам (см. warm_for_grid)
         for c, syms in by_col.items():
             self._grid_warm(c, syms, tf, limit)
