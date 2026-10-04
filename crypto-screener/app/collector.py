@@ -621,6 +621,14 @@ class ExchangeCollector:
         ~40 секунд: сигнал resume() приходил, пока цикл был занят, и биржа
         возвращалась к работе только через HOT_ROTATE. Живой замер: через 15 c
         после выключения фокуса Binance всё ещё стримил 50 монет вместо 150.
+
+        Поточечные подписки при этом сбрасываются в ccxt ПОЛНОСТЬЮ (не только
+        un_watch_*): у bybit/okx watch_*_for_symbols переиспользуют одно
+        соединение, и если resume() переподпишет топик раньше, чем долетит
+        фоновая отписка, биржа отвечает «already subscribed» лавиной ошибок
+        (живой случай: bybit orderbook.200.BTCUSDT каждые 15 с ротации).
+        Отписка + очистка messageHashes живут в одной фоновой задаче, а
+        _sync_batch перед повторной подпиской ждёт её завершения.
         """
         books = sorted(self._book_tasks)
         trades = sorted(self._trade_tasks)
@@ -637,7 +645,18 @@ class ExchangeCollector:
             if b["syms"]:
                 self._detach_batch_unwatch(kind, b["syms"])
                 b["syms"] = []
-        self._detach_cleanup(books, trades, tickers)
+        if books or trades or tickers:
+            self._pending_unwatch = asyncio.create_task(
+                self._drop_single_all(books, trades, tickers),
+                name=f"{self.cfg.id}:unwatch-all")
+            self.tasks.add(self._pending_unwatch)
+            self._pending_unwatch.add_done_callback(self.tasks.discard)
+
+    async def _drop_single_all(self, books: list[str], trades: list[str],
+                               tickers: list[str]) -> None:
+        await self._drop_single_subscriptions("book", books)
+        await self._drop_single_subscriptions("trades", trades)
+        await self._drop_single_subscriptions("tickers", tickers)
 
     async def ensure_ohlcv(self, symbols: list[str], limit: int = 400) -> int:
         """
@@ -914,8 +933,44 @@ class ExchangeCollector:
             return
         try:
             await getattr(self.ex, method)(symbol)
-        except Exception:  # noqa: BLE001
-            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("[%s] unwatch %s %s: %s: %s", self.cfg.label, kind, symbol,
+                      type(e).__name__, str(e)[:120])
+
+    async def _drop_single_subscriptions(self, kind: str, symbols: list[str]) -> None:
+        """
+        Полностью «забыть» локальные подписки ccxt.pro данного вида.
+
+        Нужен при паузе/возобновлении биржи: watch_*_for_symbols у bybit/okx
+        переиспользуют ОДНО соединение, и если ротация подписала топик ещё раз
+        до того, как отработала фоновая отписка, биржа отвечает
+        «already subscribed» лавиной ошибок на каждой ротации фокуса
+        (живой случай: bybit orderbook.200.BTCUSDT). Удаление messageHashes —
+        штатный способ ccxt сбросить состояние подписки; следующий watch
+        переподпишется корректно.
+
+        Сначала ждём завершения всех un_watch_* по символам — иначе отписка
+        долетит до биржи ПОСЛЕ повторной подписки и снимет уже новый поток.
+        """
+        coros = [self._unwatch(kind, s) for s in symbols]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
+        store_attr = {"book": "orders", "trades": "trades", "tickers": "tickers"}[kind]
+        removed = 0
+        try:
+            store = getattr(self.ex, "subscriptions", {}).get(store_attr) or {}
+            for h in list(store):
+                if any(sym in h for sym in symbols):
+                    store.pop(h, None)
+                    removed += 1
+        except Exception as e:  # noqa: BLE001
+            log.debug("[%s] drop %s subscription state: %s", self.cfg.label,
+                      kind, str(e)[:120])
+        if removed:
+            log.info("[%s] сброшено %d зависших подписок %s (пересборка потоков)",
+                     self.cfg.label, removed, kind)
 
     # ------------------------------------------------------------------
     # Батчевые WS-подписки (одна задача на чанк символов)
@@ -958,6 +1013,15 @@ class ExchangeCollector:
         наборе (замер: 56 c на переходе 150 → 50 поточечных подписок).
         """
         b = self._batch[kind]
+        # После паузы биржи фоновая отписка ещё может жить в ccxt: если
+        # подписать топик раньше, чем она завершится, bybit/okx отвечают
+        # «already subscribed» (см. _close_streams). Ждём — обычно секунды.
+        pu = getattr(self, "_pending_unwatch", None)
+        if pu is not None and not pu.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(pu), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
         alive = [t for t in b["tasks"] if not t.done()]
         rebuild = b.pop("rebuild", False)
         if want == b["syms"] and not rebuild and (alive or not want):
@@ -981,6 +1045,15 @@ class ExchangeCollector:
                 removed = [s for s in old if s not in set(want)]
                 if removed:
                     self._detach_batch_unwatch(kind, removed)
+                if rebuild:
+                    # Чанк урезали — старые задачи отменены, но подписки на
+                    # бирже живут под СТАРЫМ размером чанка. Фоновая отписка
+                    # «только выпавших» тут ничего не снимет (состав тот же),
+                    # и новая подписка тем же топиком получит от биржи
+                    # «already subscribed» лавиной на каждой ротации фокуса
+                    # (живой случай: bybit orderbook.200.BTCUSDT). Снимаем
+                    # весь старый список; новые чанки доедут до подписки сами.
+                    self._detach_batch_unwatch(kind, old)
         if not want:
             return
         coro = {"book": self._book_stream_batch,

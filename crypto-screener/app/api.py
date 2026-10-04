@@ -781,14 +781,17 @@ async def api_grid(request: Request):
     hub = getattr(app.state, "hub", None)
 
     def build_cell(r: dict, candles: list) -> dict:
-        st = STORE.get(r["k"])
+        # r["k"] может отсутствовать (dict без ключа или кортеж — если caller
+        # ошибся форматом). Раньше это роняло весь /api/grid с TypeError.
+        rk = r["k"] if isinstance(r, dict) else None
+        st = STORE.get(rk) if rk else None
         if not candles and st and st.ohlcv:
             # биржа не ответила / нет REST-пути (replay) — собираем из 1m-буфера
             candles = resample(st.ohlcv, TF_SECONDS[tf])[-limit:]
         candles = normalize_candle_volume(candles, st.inverse, st.contract_size,
                                           st.ohlcv_vol_in_contracts) if (candles and st) else candles
         return {
-            "k": r["k"], "s": r["s"], "b": r["b"], "exl": r["exl"], "mt": r["mt"],
+            "k": rk or "", "s": r["s"], "b": r["b"], "exl": r["exl"], "mt": r["mt"],
             "dex": r.get("dex", False),
             "last": r["last"], "chg": r["chg"], "vol": r["vol"],
             "natr": r["natr"], "spike": r["spike"],
@@ -806,8 +809,11 @@ async def api_grid(request: Request):
         # секунд — их фронт освежает из WS-потока (gridTick + строки скринера).
         gkey = (tuple(r["k"] for r in rows), ex, mt, tf, n, limit)
         try:
-            cells = await hub.get_grid(gkey, [(r["ex"], r["s"]) for r in rows],
-                                       tf, limit, build_cell)
+            # ВАЖНО: get_grid принимает СЛОВАРИ строк скринера (в них есть
+            # "k"/"mt"), а не кортежи. С кортежем cell-строка теряла ключ и
+            # build_cell падал с TypeError («tuple indices must be integers
+            # or slices, not str») — весь grid отдавался без свечей.
+            cells = await hub.get_grid(gkey, rows, tf, limit, build_cell)
         except Exception as e:  # noqa: BLE001
             # Сетка не должна ронять запрос: без свечей отдаём строки скринера
             # (плитки будут с ценой/объёмом, но пустым графиком до следующего
