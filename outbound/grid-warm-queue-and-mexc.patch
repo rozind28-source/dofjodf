@@ -1,0 +1,175 @@
+diff --git a/crypto-screener/app/api.py b/crypto-screener/app/api.py
+index db55119..7c85d61 100644
+--- a/crypto-screener/app/api.py
++++ b/crypto-screener/app/api.py
+@@ -451,6 +451,43 @@ async def _loop_lag_monitor() -> None:
+ app = FastAPI(title="Crypto Screener (self-hosted)", version="0.1.0", lifespan=lifespan)
+ 
+ 
++def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
++    """
++    Фильтр шума от ccxt.pro при обрыве WS-сессий.
++
++    ccxt мультиплексирует подписки одного вида на одной WS-сессии. Когда
++    она умирает (ping-pong keepalive missed, как у MEXC), ccxt циклом
++    проходит по всем futures в client.subscriptions и ставит каждому
++    exception. Для символов, чьи задачи _book_stream уже отменены ротацией,
++    future никто не await-ит — Python ругается
++    «Future exception was never retrieved» и печатает полный traceback.
++
++    Это НЕ потеря данных: живые потоки получат тот же RequestTimeout в
++    свой await, обработают его в except-ветке и переподключатся сами
++    (backoff + _batch_fail / _book_stream логика). Мёртвые задачи уже не
++    работают, и их «необработанные» исключения ничего не значат.
++
++    Глушим ТОЛЬКО этот класс сообщений: реальные ошибки (unhandled
++    exception в задаче, ошибки event loop) уходят в дефолтный хендлер и
++    остаются видны в логе.
++    """
++    msg = context.get("message", "")
++    exc = context.get("exception")
++    if "Future exception was never retrieved" in msg:
++        # RequestTimeout от ccxt — ожидаемое следствие обрыва WS, гасим
++        # молча; для остальных причин оставляем одну короткую строку,
++        # чтобы не потерять что-то необычное.
++        if exc is not None and type(exc).__name__ != "RequestTimeout":
++            log.debug("фоновая задача: %s: %s", type(exc).__name__, str(exc)[:200])
++        return
++    loop.default_exception_handler(context)
++
++
++@app.on_event("startup")
++async def _install_asyncio_exception_handler() -> None:
++    asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
++
++
+ @app.middleware("http")
+ async def _log_errors(request: Request, call_next):
+     """
+@@ -702,9 +739,12 @@ async def api_candles(request: Request):
+         return JSONResponse({"error": f"неподдерживаемый таймфрейм {tf!r}",
+                              "supported": sorted(TF_SECONDS)}, status_code=400)
+     try:
+-        limit = max(20, min(int(qp.get("limit", 300)), 1000))
++        # 100 свечей хватает для визуального контроля тренда; больше — уже
++        # не «удобно отслеживать» (жалоба пользователя), а полотно, которое
++        # не влезает в карточку без скролла/зума.
++        limit = max(20, min(int(qp.get("limit", 100)), 200))
+     except (TypeError, ValueError):
+-        limit = 300
++        limit = 100
+ 
+     st = STORE.get(key)
+     if not st:
+@@ -761,9 +801,9 @@ async def api_grid(request: Request):
+                              "supported": sorted(TF_SECONDS)}, status_code=400)
+     try:
+         n = max(1, min(int(qp.get("n", 9)), 25))
+-        limit = max(20, min(int(qp.get("limit", 200)), 400))
++        limit = max(20, min(int(qp.get("limit", 100)), 200))
+     except (TypeError, ValueError):
+-        n, limit = 9, 200
++        n, limit = 9, 100
+ 
+     # «Графики» = то, что сейчас показывает скринер: те же query-параметры
+     # (фильтры + сортировка + поиск), та же сортировка. Фронт присылает их
+diff --git a/crypto-screener/app/collector.py b/crypto-screener/app/collector.py
+index 69fcf1b..6443266 100644
+--- a/crypto-screener/app/collector.py
++++ b/crypto-screener/app/collector.py
+@@ -50,7 +50,12 @@ FUNDING_REFRESH = 30.0   # сек
+ CANDLES_TTL = 12.0       # сек: время жизни кэша свечей для графиков
+ MAX_STREAM_FAILS = 5     # подряд идущих отказов биржи → гасим поток по символу
+ FAIL_WINDOW = 120.0      # сек: окно, внутри которого отказы считаются «подряд»
+-CORRELATED_FAIL_WINDOW = 2.0   # сек: если все отказы уложились сюда — это обрыв соединения
++# 5 секунд вместо 2: у MEXC ccxt ставит exception на futures мёртвой
++# WS-сессии последовательно, с обработкой сотен символов это легко
++# растягивается на 3-4 секунды. С окном 2 с выключатель принимал такую
++# пачку за «много независимых плохих символов» и банил весь стакан MEXC
++# (ровно тот баг из BUGFIXES.md, п.24, но уже для MEXC).
++CORRELATED_FAIL_WINDOW = 5.0   # сек: если все отказы уложились сюда — это обрыв соединения
+ BAN_TTL = 600.0          # сек: через сколько амнистировать забаненные символы
+ PAUSED_TICKER_REFRESH = 120.0   # сек: период опроса тикеров у биржи вне фокуса
+ FOCUS_OHLCV_CONCURRENCY = 24    # параллельных запросов свечей при пересчёте отбора
+diff --git a/crypto-screener/app/config.py b/crypto-screener/app/config.py
+index ce45a2e..c1f29a1 100644
+--- a/crypto-screener/app/config.py
++++ b/crypto-screener/app/config.py
+@@ -100,7 +100,15 @@ CORE_EXCHANGES: list[ExchangeConfig] = [
+                    batch_full_unwatch=True),
+     ExchangeConfig("bybit",       "Bybit",       "swap", top_n=250, books=60, batch_chunk=10),
+     ExchangeConfig("okx",         "OKX",         "swap", top_n=250, books=60),
+-    ExchangeConfig("mexc",        "MEXC",        "swap", top_n=250, books=50, ticker_refresh=30.0,
++    # MEXC — самая тяжёлая биржа по WS: стакан всегда ~1500 уровней (limit
++    # игнорируется), ccxt мультиплексирует ВСЕ подписки на одной WS-сессии,
++    # и её ping не успевает уйти под нагрузкой → «ping-pong keepalive
++    # missing on time», лавина RequestTimeout на все символы сразу и
++    # «Future exception was never retrieved» от мёртвых задач.
++    # books=15 втрое сокращает поток по одному WS-соединению; плотности
++    # показываются на тех же 15 монетах, что и раньше (первая по объёму
++    # часть hot-набора), — визуально ничего не теряется.
++    ExchangeConfig("mexc",        "MEXC",        "swap", top_n=250, books=15, ticker_refresh=30.0,
+                    ohlcv_vol_in_contracts=True),
+     # Gate futures.order_book_update принимает limit не больше 100:
+     # при 200 отвечает BadRequest на ВСЕ символы (проверено замером).
+@@ -113,7 +121,7 @@ CORE_EXCHANGES: list[ExchangeConfig] = [
+                    batch_full_unwatch=True),
+     ExchangeConfig("bybit",       "Bybit",       "spot", top_n=150, books=20, batch_chunk=10),
+     ExchangeConfig("okx",         "OKX",         "spot", top_n=150, books=20),
+-    ExchangeConfig("mexc",        "MEXC",        "spot", top_n=150, books=20, ticker_refresh=30.0),
++    ExchangeConfig("mexc",        "MEXC",        "spot", top_n=150, books=8, ticker_refresh=30.0),
+     ExchangeConfig("gate",        "Gate.io",     "spot", top_n=150, books=20, book_limit=100),
+     # --- DEX (perp): спота у них нет, тумблер это учитывает ---
+     ExchangeConfig("aster",       "Aster",       "swap", top_n=200, books=40, dex=True),
+diff --git a/crypto-screener/web/app.js b/crypto-screener/web/app.js
+index 8e09407..c1f7c92 100644
+--- a/crypto-screener/web/app.js
++++ b/crypto-screener/web/app.js
+@@ -1366,7 +1366,7 @@ async function loadGrid() {
+     // Пользователь отсортировал, например, по NATR — плитка строится в этом
+     // же порядке, а не по объёму «как серверу удобнее».
+     const q = Object.assign({}, collectQuery(),
+-                            { ex: g.ex || "", mt: state.mt, tf: g.tf, n: g.n, limit: 250 });
++                            { ex: g.ex || "", mt: state.mt, tf: g.tf, n: g.n, limit: 100 });
+     try {
+       const r = await fetchT("/api/grid?" + new URLSearchParams(q).toString(), 15000);
+       if (r.ok) d = await r.json();
+@@ -1614,7 +1614,7 @@ async function loadCandles(key, row) {
+   let failed = false;
+   if (!state.demo) {
+     try {
+-      const r = await fetchT(`/api/candles?key=${encodeURIComponent(key)}&tf=${state.chartTf}&limit=400`, 12000);
++      const r = await fetchT(`/api/candles?key=${encodeURIComponent(key)}&tf=${state.chartTf}&limit=100`, 12000);
+       if (r.ok) d = await r.json();
+       else failed = true;
+     } catch (e) { failed = true; d = null; }
+@@ -1659,7 +1659,11 @@ function chartTick(row) {
+ /** Синтетические свечи для DEMO-режима: тот же формат, что отдаёт бэкенд. */
+ function demoCandles(key, row) {
+   const tf = TF_SEC[state.chartTf] || 900;
+-  const n = 187;   // намеренно нестандартное число: по нему тест отличает демо от ответа биржи
++  // 100 свечей — как в live-режиме (см. /api/candles?limit=100), чтобы
++  // DEMO и прод-картинка визуально совпадали. «187» был намеренным
++  // маркером отличия демо от биржи, но с этим числом демо-график выглядел
++  // заметно длиннее живого и вводил в заблуждение.
++  const n = 100;
+   const now = Math.floor(Date.now() / 1000);
+   const end = now - (now % tf);
+   const last = row && row.last ? row.last : 100;
+diff --git a/crypto-screener/web/chart.js b/crypto-screener/web/chart.js
+index 617555a..ee5e792 100644
+--- a/crypto-screener/web/chart.js
++++ b/crypto-screener/web/chart.js
+@@ -25,7 +25,11 @@ class CandleChart {
+       crossColor: "rgba(180,200,225,.45)",
+       padLeft: 6, padRight: 64, padTop: 10, padBottom: 20,
+       volRatio: 0.2,          // доля высоты под объём
+-      minBars: 20, maxBars: 600,
++      // 150 — компромисс: свечей на экране 100 (как отдаёт /api/candles),
++      // зум до 150 даёт небольшой запас, чтобы разглядеть детали, но не
++      // раздувает полотно до неудобной ширины. Было 600 — «простыня»,
++      // которую пользователь не мог охватить взглядом.
++      minBars: 20, maxBars: 150,
+     }, opts);
+ 
+     this.data = { candles: [], densities: [], spikes: [], last: null };

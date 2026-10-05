@@ -1,0 +1,172 @@
+diff --git a/crypto-screener/app/api.py b/crypto-screener/app/api.py
+index e81557f..b8e9177 100644
+--- a/crypto-screener/app/api.py
++++ b/crypto-screener/app/api.py
+@@ -777,7 +777,21 @@ async def api_grid(request: Request):
+     rows = [r for r in all_rows if (not ex or r["exl"] == ex) and r["mt"] == mt]
+     rows = F.apply_filters(rows, F.parse_params(qp),
+                            F.base_universe(rows) if qp.get("unique") else None)
+-    rows = F.sort_rows(rows, qp.get("sort", "vol"), qp.get("desc") != "0")[:n]
++    sort_key = qp.get("sort", "vol")
++    if sort_key not in F.SORT_FIELDS:
++        sort_key = "vol"
++    desc = qp.get("desc") != "0"
++    # Порядок плиток должен СОВПАДАТЬ с таблицей скринера — в т.ч. при
++    # одинаковых значениях сортируемого поля (у свежих монет natr/tr часто
++    # равны нулю). Поэтому сортируем по той же паре (ключ, k), что и фронт
++    # в gridSortCmp(): без второго ключа sorted() оставил бы «ничьюные»
++    # строки в произвольном порядке, сетка пережил бы перестановку при
++    # каждом новом отборе, а фронт, пересортировывая stable-сортировкой,
++    # путал ячейки местами → плитки выглядели «пропавшими/не теми».
++    rows.sort(key=lambda r: ((r.get(sort_key) is None,
++                              -(r.get(sort_key) or 0) if desc
++                              else (r.get(sort_key) or 0), r["k"])))
++    rows = rows[:n]
+     if focus_on and not ex:
+         ex = focus.spec.ex
+ 
+diff --git a/crypto-screener/app/collector.py b/crypto-screener/app/collector.py
+index 913ede4..475e3c0 100644
+--- a/crypto-screener/app/collector.py
++++ b/crypto-screener/app/collector.py
+@@ -1735,33 +1735,59 @@ class ExchangeCollector:
+ 
+     async def warm_for_grid(self, symbols: list[str], tf: str, limit: int) -> None:
+         """
+-        Подкачка 1m-свечей символам сетки графиков (/api/grid).
++        Подкачка свечей символам сетки графиков (/api/grid).
+ 
+-        Пока у монеты нет буфера 1m-свечей, каждый запрос сетки обязан тянуть
+-        её запрошенный ТФ через REST биржи; при n=9..25 ячеек это очередь из
+-        быстрых, но дорогих ответов — часть ячеек отваливается по таймауту и
+-        плитки остаются пустыми («график периодически пропадает»). Фоновый
+-        _ohlcv_loop обновляет только горячий набор, а пул кандидатов фокуса
+-        вообще никем не подкачивался между пересчётами отбора.
++        Ключевое: прогреваем НЕ только 1m-буфер, а сразу запрошенный ТФ —
++        он кладётся в _candles_cache с TTL=GRID_TTL, и get_grid отдаёт
++        плитки из кэша без похода на биржу. Раньше грелся лишь 1m-буфер,
++        но у свежих кандидатов нового отбора он ПУСТОЙ (монета только что
++        попала в сетку), resample из STORE невозможен, и каждая такая
++        плитка уходила в REST-очередь с таймаутом 8 c → «графики есть при
++        выборе биржи, а после нового отбора пропадают».
+ 
+-        Здесь тот же фоновый цикл, но адресно: символам текущей сетки, с
+-        увеличенным TTL (GRID_TTL) — редкие заходы в сетку не превращаются в
+-        шторм REST-запросов. Отдельных задач не создаём: разовые gather по
+-        чанкам идут внутри уже существующего потока событий.
++        Очередь прогрева ограничена (не больше ohlcv_concurrency*2 за проход)
++        и идёт через _sem_rest — медленная биржа не захлёбывается.
+         """
+-        todo = []
+         now = time.time()
++        todo = []
++        ck_tail = (tf, limit)
+         for sym in symbols:
++            cached = self._candles_cache.get((sym,) + ck_tail)
++            if cached and now - cached[0] < GRID_TTL:
++                continue                       # сетка этого ТФ уже прогрета
+             st = self._state(sym)
+-            if not st.ohlcv or now - getattr(st, "ohlcv_ts", 0.0) >= GRID_TTL:
+-                todo.append(sym)
++            if st.ohlcv and now - getattr(st, "ohlcv_ts", 0.0) < CANDLES_TTL \
++                    and self._fresh_candles_from_store(sym, tf, limit, now) is not None:
++                continue                       # resample из свежего 1m закроет нужду
++            todo.append(sym)
+         if not todo:
+             return
+         chunk = max(1, self.settings.ohlcv_concurrency)
+-        await asyncio.gather(*[self._fetch_ohlcv(s, force=True, ttl=GRID_TTL)
++        await asyncio.gather(*[self._warm_tf(s, tf, limit)
+                                for s in todo[:chunk * 2]],
+                              return_exceptions=True)
+ 
++    async def _warm_tf(self, symbol: str, tf: str, limit: int) -> None:
++        """Разовое REST-получение свечей нужного ТФ в _candles_cache (GRID_TTL)."""
++        if symbol not in self.ex.markets:
++            return
++        async with self._sem_rest:
++            try:
++                candles = await self.ex.fetch_ohlcv(symbol, tf, limit=limit)
++                STORE.bump("rest_calls")
++            except Exception as e:  # noqa: BLE001
++                STORE.bump("errors")
++                log.debug("[%s] grid-warm %s %s: %s: %s", self.cfg.label, symbol,
++                          tf, type(e).__name__, str(e)[:140])
++                return
++            if candles:
++                self._candles_cache[(symbol, tf, limit)] = (time.time(), candles)
++                # параллельно наполняем 1m-буфер для будущих resample
++                if not self._state(symbol).ohlcv:
++                    asyncio.create_task(self._fetch_ohlcv(symbol, force=True,
++                                                          ttl=GRID_TTL),
++                                        name=f"{self.cfg.id}:warm1m:{symbol}")
++
+     async def watch_candles(self, symbols: list[str], tf: str, limit: int) -> None:
+         """
+         WS-подписка на kline для сетки графиков (там, где ccxt.pro её умеет).
+@@ -2155,6 +2181,18 @@ class CollectorHub:
+             log.warning("сетка: не найдены коллекторы для %s (доступны: %s)",
+                         ", ".join(sorted(unresolved)),
+                         ", ".join(f"{c.cfg.id}/{c.cfg.market}" for c in self.collectors))
++        # WS kline-поток под текущий набор плиток (last-writer-wins внутри
++        # watch_candles). Именно его отсутствие приводило к «графики есть при
++        # выборе биржи, а после нового отбора пропадают»: состав сетки
++        # меняется каждые ~15 с, старые кандидаты переставали стримиться,
++        # их 1m-буфер протухал (CANDLES_TTL), и новые плитки уходили в
++        # REST-очередь медленной биржи, где большинство отваливалось по
++        # таймауту → «нет свечей». Метод async — гоняем через create_task,
++        # чтобы не блокировать выдачу ячеек на подписку.
++        for c, syms in by_col.items():
++            _GRID_WARM_TASKS.add(asyncio.create_task(
++                self._resubscribe_grid(c, syms, tf),
++                name=f"gridsub:{c.cfg.id}"))
+         # фон: добираем 1m-свечи недостающим символам (см. warm_for_grid)
+         for c, syms in by_col.items():
+             self._grid_warm(c, syms, tf, limit)
+diff --git a/crypto-screener/web/app.js b/crypto-screener/web/app.js
+index c6db2b2..783b935 100644
+--- a/crypto-screener/web/app.js
++++ b/crypto-screener/web/app.js
+@@ -1382,7 +1382,13 @@ async function loadGrid() {
+   // ячейки по тем же sort/desc; в DEMO и как страховка при сбое сортируем
+   // сами — так сетка и таблица всегда показывают один и тот же список.
+   if (d && Array.isArray(d.cells)) {
+-    d.cells = d.cells.slice().sort(gridSortCmp()).slice(0, g.n);
++    // В live-режиме НЕ пересортировываем: сервер уже выдал ячейки в порядке
++    // скринера с детерминированным вторичным ключом. Клиентская сортировка
++    // без tie-breaker'а при равных значениях (u fresh монет natr/tr = 0)
++    // тасовала плитки местами между циклами — визуально «графики меняются
++    // и пропадают после нового отбора». Срез по n оставляем на всякий случай.
++    if (!state.demo) d.cells = d.cells.slice(0, g.n);
++    else d.cells = d.cells.slice().sort(gridSortCmp()).slice(0, g.n);
+     if (state.focus.enabled && (!state.focus.server || failed)) {
+       state.focus.count = d.cells.length;
+       state.focus.keys = d.cells.map((c) => c.k);
+@@ -1390,7 +1396,26 @@ async function loadGrid() {
+   }
+   if (state.focus.enabled && d && d.focus) renderFocus(d.focus);
+   g.lastFailed = failed;
+-  g.cells = d.cells || [];
++  const newCells = d.cells || [];
++  // «Графики пропадают после нового отбора»: состав сетки меняется каждые
++  // ~15 с, и если очередная волна /api/grid пришла без свечей (биржа не
++  // успела ответить, REST-очередь занята), перерисовка стирала живые графики
++  // и показывала «нет свечей». Держим прежние ячейки там, где новых свечей
++  // нет, а старые были — плитка переживёт промах одного цикла; как только
++  // бэкенд догреет свечи, данные обновятся.
++  if (g.cells && g.cells.length) {
++    const prevByKey = new Map(g.cells.map((c) => [c.k, c]));
++    for (let i = 0; i < newCells.length; i++) {
++      const c = newCells[i];
++      const prev = prevByKey.get(c.k);
++      if ((!c.candles || !c.candles.length) && prev &&
++          prev.candles && prev.candles.length) {
++        newCells[i] = Object.assign({}, c, { candles: prev.candles,
++                                             candles_ok: true });
++      }
++    }
++  }
++  g.cells = newCells;
+   g.tfSeconds = d.tf_seconds || TF_SEC[g.tf] || 300;
+   renderGridCells();
+   const head = $("#view-grid .view-head h2");

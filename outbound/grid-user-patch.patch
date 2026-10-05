@@ -1,0 +1,272 @@
+From b1e68eb6655b4c2a88c1a3303cfe4372ae89c3aa Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 5 Oct 2026 14:58:09 +0000
+Subject: [PATCH] Apply user-supplied grid fix patch: warm-pending queue, no
+ wait_for(timeout=0) for gridsub, server-side last-good candles merge,
+ focus-set filter in api_grid, DOM-reusing renderGridCells
+
+---
+ crypto-screener/app/api.py       |   9 +++
+ crypto-screener/app/collector.py |  63 ++++++++++++++++---
+ crypto-screener/web/app.js       | 101 ++++++++++++++++++++++++-------
+ 3 files changed, 142 insertions(+), 31 deletions(-)
+
+diff --git a/crypto-screener/app/api.py b/crypto-screener/app/api.py
+index 7b97ab9..db55119 100644
+--- a/crypto-screener/app/api.py
++++ b/crypto-screener/app/api.py
+@@ -777,6 +777,15 @@ async def api_grid(request: Request):
+     rows = [r for r in all_rows if (not ex or r["exl"] == ex) and r["mt"] == mt]
+     rows = F.apply_filters(rows, F.parse_params(qp),
+                            F.base_universe(rows) if qp.get("unique") else None)
++    # В фокусе ячейки сетки обязаны совпадать с отбором: только для этих
++    # монет держатся WS kline / 1m-буфер. Раньше сетка брала топ из ВСЕЙ
++    # биржи, а стрим шёл только по focus.key_set — свежие «не те» монеты
++    # уходили в REST с таймаутом 8 c и рождались пустыми. Пока отбор
++    # предварительный (provisional) или пустой (свечи ещё едут) — фильтр
++    # не применяем: иначе сетка схлопнется до нуля.
++    if focus_on and focus.keys and not focus.provisional:
++        focus_set = set(focus.keys)
++        rows = [r for r in rows if r["k"] in focus_set]
+     sort_key = qp.get("sort", "vol")
+     if sort_key not in F.SORT_FIELDS:
+         sort_key = "vol"
+diff --git a/crypto-screener/app/collector.py b/crypto-screener/app/collector.py
+index b1c382f..69fcf1b 100644
+--- a/crypto-screener/app/collector.py
++++ b/crypto-screener/app/collector.py
+@@ -2217,6 +2217,10 @@ class CollectorHub:
+         self.tasks: list[asyncio.Task] = []
+         # кэш готовых сеток /api/grid: key → (ts, cells); см. get_grid()
+         self._grids: dict[tuple, tuple[float, list]] = {}
++        # последние УДАЧНЫЕ свечи по (символ, tf): нужен для серверного
++        # merge, когда состав сетки сменился и у клиента нет prev-ячейки
++        # (см. get_grid). Храним 5 минут.
++        self._last_good_candles: dict[tuple[str, str], tuple[float, list]] = {}
+         # WS kline-подписки сетки: collector id → {tf: набор символов}
+         self._grid_subs: dict[str, dict[str, set]] = {}
+         # незавершённые подписки по коллектору: не даём двум волнам /api/grid
+@@ -2393,15 +2397,17 @@ class CollectorHub:
+         # (запросы к биржам), таймаут 0 мгновенно вернёт TimeoutError —
+         # выдача ячеек не блокируется подпиской; если планировщик пуст
+         # (тесты/демо), подписка успевает зарегистрироваться до gather.
++        # ВАЖНО: не ждём подписку через wait_for(..., timeout=0) — этот
++        # приём «дать задаче шанс запуститься» НЕ работал: если в цикле
++        # событий уже есть I/O (а он тут всегда есть — fetch_candles идут
++        # ниже), wait_for таймаутит мгновенно, WS-подписка не успевает
++        # встать, и первый get_grid после смены набора уходит в REST с
++        # таймаутом 8 c. Просто создаём задачу — она выполнится сама.
+         for c, syms in by_col.items():
+             t = asyncio.create_task(self._resubscribe_grid(c, syms, tf),
+                                     name=f"gridsub:{c.cfg.id}")
+             _GRID_WARM_TASKS.add(t)
+             t.add_done_callback(_GRID_WARM_TASKS.discard)
+-            try:
+-                await asyncio.wait_for(asyncio.shield(t), timeout=0)
+-            except asyncio.TimeoutError:
+-                pass
+         # фон: добираем 1m-свечи недостающим символам (см. warm_for_grid)
+         for c, syms in by_col.items():
+             self._grid_warm(c, syms, tf, limit)
+@@ -2426,7 +2432,29 @@ class CollectorHub:
+         # параллельно по всем ячейкам: при последовательном опросе сетка из
+         # 25 плиток на медленной бирже складывалась в минуты ожидания
+         results = await asyncio.gather(*[one(r, c) for r, c in zip(rows, routes)])
++        # Серверный merge последнего успешного ответа по паре (символ, tf).
++        #
++        # Зачем на сервере, а не только на клиенте (там уже есть prevByKey):
++        # клиентский merge спасает ТОЛЬКО когда gkey совпадает. В фокусе
++        # отбор пересчитывается каждые 15 c, набор ключей меняется — у
++        # клиента для нового ключа нет prev, и первый промах REST (таймаут
++        # биржи) сразу рисует «нет свечей». Здесь же мы помним последние
++        # удачные свечи по символу и ТФ, независимо от того, что состав
++        # сетки поменялся.
++        now_ts = time.time()
+         for row, candles in zip(rows, results):
++            rk = row["k"] if isinstance(row, dict) else None
++            if rk and candles:
++                self._last_good_candles[(rk, tf)] = (now_ts, candles)
++        for row, candles in zip(rows, results):
++            rk = row["k"] if isinstance(row, dict) else None
++            if rk and not candles:
++                prev = self._last_good_candles.get((rk, tf))
++                # 5 минут — с запасом больше GRID_TTL; дольше держать не
++                # нужно: за это время либо WS kline восстановится, либо
++                # символ окончательно выпал из отбора.
++                if prev and now_ts - prev[0] < 300.0:
++                    candles = prev[1]
+             cells.append(build_cell(row, candles))
+         self._grids[key] = (time.time(), cells)
+         if len(self._grids) > GRID_CACHE_MAX:
+@@ -2435,17 +2463,34 @@ class CollectorHub:
+         return cells
+ 
+     def _grid_warm(self, col, syms: list[str], tf: str, limit: int) -> None:
+-        """Разовая фоновая задача прогрева свечей сетки (не ждём ответа)."""
+-        # Одна волна на биржу: пока предыдущий прогрев не разобран, новые
+-        # вызовы /api/grid просто пропускаем — данные доходят из уже идущей
+-        # очереди, дубли только забивают _sem_rest и плодят таймауты.
++        """
++        Разовая фоновая задача прогрева свечей сетки (не ждём ответа).
++
++        Раньше: если волна прогрева уже идёт, новый вызов молча пропускался
++        (``_grid_warm_busy = True`` → ``return``). При ротации фокуса (раз в
++        15 с) новый набор монет не прогревался вовсе, пока висела старая
++        волна (медленная биржа + занятый ``_sem_rest`` — десятки секунд).
++        Сетка получала пустые ячейки и рисовала «нет свечей».
++
++        Теперь: последний пришедший запрос перезаписывает pending-слот, а
++        активная задача после завершения текущей волны сразу берёт
++        актуальный набор из pending и греет его. Ни один вызов ``_grid_warm``
++        не теряется.
++        """
++        col._grid_warm_pending = (list(syms), tf, limit)
+         if getattr(col, "_grid_warm_busy", False):
+             return
+         col._grid_warm_busy = True
+ 
+         async def run() -> None:
+             try:
+-                await col.warm_for_grid(syms, tf, limit)
++                while True:
++                    pending = getattr(col, "_grid_warm_pending", None)
++                    if not pending:
++                        break
++                    col._grid_warm_pending = None
++                    s, t, l = pending
++                    await col.warm_for_grid(s, t, l)
+             finally:
+                 col._grid_warm_busy = False
+ 
+diff --git a/crypto-screener/web/app.js b/crypto-screener/web/app.js
+index cb35071..8e09407 100644
+--- a/crypto-screener/web/app.js
++++ b/crypto-screener/web/app.js
+@@ -1431,11 +1431,22 @@ function renderGridCells() {
+   const g = state.grid;
+   const host = $("#charts-grid");
+   if (!host) return;
+-  // уничтожаем лишние чарты
+-  for (const [k, ch] of Array.from(g.charts)) {
+-    if (!g.cells.some((c) => c.k === k)) { g.charts.delete(k); }
++  // Переиспользуем ячейки по dataset.k, а не пересоздаём DOM целиком.
++  //
++  // Было: host.innerHTML = "" — и если очередная волна /api/grid принесла
++  // для части плиток пустые candles, живые графики стирались и заменялись
++  // на «нет свечей». Серверный merge (см. get_grid) эту дыру уже закрывает,
++  // но клиентская перерисовка всё равно не должна сносить canvas: у живой
++  // ячейки уже есть масштаб/зум/позиция, их потеря выглядит как «график
++  // пропал и появился заново».
++  const wantKeys = new Set(g.cells.map((c) => c.k));
++  for (const el of Array.from(host.children)) {
++    if (!wantKeys.has(el.dataset.k)) { el.remove(); g.charts.delete(el.dataset.k); }
+   }
+-  host.innerHTML = "";
++  // индекс существующих ячеек по ключу
++  const existing = new Map();
++  for (const el of host.children) existing.set(el.dataset.k, el);
++
+   if (!g.cells.length) {
+     const f = state.focus;
+     const why = f.enabled
+@@ -1445,33 +1456,79 @@ function renderGridCells() {
+       : `Нет данных: для «${esc(g.ex || "всех бирж")}» рынок
+          «${state.mt === "spot" ? "спот" : "фьючерсы"}» не подключён или пуст.
+          ${state.mt === "spot" ? "Попробуйте переключиться на фьючерсы." : ""}`;
+-    host.innerHTML = `<div class="cc-empty" style="grid-column:1/-1">${why}</div>`;
++    if (!host.querySelector(".cc-empty")) {
++      host.innerHTML = `<div class="cc-empty" style="grid-column:1/-1">${why}</div>`;
++    } else {
++      host.querySelector(".cc-empty").innerHTML = why;
++    }
+     return;
+   }
+   for (const cell of g.cells) {
+-    const el = document.createElement("div");
+-    el.className = "chart-cell";
+-    el.dataset.k = cell.k;
+-    el.innerHTML = `
+-      <div class="cc-head">
+-        <span class="cc-sym">${esc(cell.b || cell.s)}</span>
+-        <span class="cc-ex">${esc(cell.exl)}${cell.dex ? " ◆" : ""}</span>
+-        <span class="cc-chg ${cell.chg > 0 ? "pos" : cell.chg < 0 ? "neg" : ""}">${fmt.pct(cell.chg, 2)}</span>
+-        <button class="cc-pick" title="Открыть карточку инструмента">⤢</button>
+-      </div>
+-      <div class="cc-body"><canvas></canvas></div>
+-      ${cell.spike ? '<div class="cc-spike" title="спайк объёма/сделок">⚡</div>' : ""}`;
+-    host.appendChild(el);
+-    $(".cc-pick", el).addEventListener("click", (ev) => { ev.stopPropagation(); openDrawer(cell.k); });
+-    el.addEventListener("dblclick", () => openDrawer(cell.k));
++    let el = existing.get(cell.k);
++    if (!el) {
++      el = document.createElement("div");
++      el.className = "chart-cell";
++      el.dataset.k = cell.k;
++      el.innerHTML = `
++        <div class="cc-head">
++          <span class="cc-sym">${esc(cell.b || cell.s)}</span>
++          <span class="cc-ex">${esc(cell.exl)}${cell.dex ? " ◆" : ""}</span>
++          <span class="cc-chg ${cell.chg > 0 ? "pos" : cell.chg < 0 ? "neg" : ""}">${fmt.pct(cell.chg, 2)}</span>
++          <button class="cc-pick" title="Открыть карточку инструмента">⤢</button>
++        </div>
++        <div class="cc-body"><canvas></canvas></div>
++        ${cell.spike ? '<div class="cc-spike" title="спайк объёма/сделок">⚡</div>' : ""}`;
++      host.appendChild(el);
++      $(".cc-pick", el).addEventListener("click", (ev) => { ev.stopPropagation(); openDrawer(cell.k); });
++      el.addEventListener("dblclick", () => openDrawer(cell.k));
++    } else {
++      // ячейка уже есть — обновляем только шапку, canvas не трогаем
++      const head = el.querySelector(".cc-head");
++      if (head) {
++        const chgEl = head.querySelector(".cc-chg");
++        if (chgEl) {
++          chgEl.className = "cc-chg " + (cell.chg > 0 ? "pos" : cell.chg < 0 ? "neg" : "");
++          chgEl.textContent = fmt.pct(cell.chg, 2);
++        }
++      }
++      // индикатор спайка мог появиться/исчезнуть
++      const hasSpike = !!el.querySelector(".cc-spike");
++      if (cell.spike && !hasSpike) {
++        const s = document.createElement("div");
++        s.className = "cc-spike";
++        s.title = "спайк объёма/сделок";
++        s.textContent = "⚡";
++        el.appendChild(s);
++      } else if (!cell.spike && hasSpike) {
++        el.querySelector(".cc-spike").remove();
++      }
++    }
+ 
+     const cv = $("canvas", el);
+     if (!cell.candles || !cell.candles.length) {
+       const body = $(".cc-body", el);
+-      body.innerHTML = `<div class="cc-empty">нет свечей${cell.candles_ok === false ? " (таймаут биржи)" : ""}</div>`;
+-      host.appendChild(el);
++      // Пустые свечи, но canvas уже был: НЕ стираем его. Оставляем
++      // последний успешный график и показываем поверх маленькую пометку.
++      // Раньше `body.innerHTML = ...` сносил canvas, и на один-два цикла
++      // (пока не догреются свечи) плитка «мигала» пустотой.
++      if (body.querySelector("canvas")) {
++        let hint = body.querySelector(".cc-hint");
++        if (!hint) {
++          hint = document.createElement("div");
++          hint.className = "cc-hint";
++          hint.style.cssText =
++            "position:absolute;right:6px;bottom:4px;font:9.5px var(--mono);color:var(--txt3)";
++          body.appendChild(hint);
++        }
++        hint.textContent = "обновление…";
++      } else {
++        body.innerHTML = `<div class="cc-empty">нет свечей${cell.candles_ok === false ? " (таймаут биржи)" : ""}</div>`;
++      }
+       continue;
+     }
++    // свечи пришли — прячем пометку «обновление…», если она была
++    const hint = $(".cc-hint", el);
++    if (hint) hint.remove();
+     let ch = g.charts.get(cell.k);
+     if (!ch && typeof CandleChart !== "undefined") {
+       ch = new CandleChart(cv, { padRight: 52, padBottom: 16, volRatio: 0.22, minBars: 20 });
+-- 
+2.39.5
+

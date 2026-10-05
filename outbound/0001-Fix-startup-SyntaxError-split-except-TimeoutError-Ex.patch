@@ -1,0 +1,85 @@
+From 0971bc54509e1956f0a7aa300521daea83168e62 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Sun, 4 Oct 2026 12:09:42 +0000
+Subject: [PATCH] Fix startup SyntaxError: split except (TimeoutError,
+ Exception) in _sync_batch
+
+---
+ crypto-screener/app/api.py       | 23 +++++++++++++----------
+ crypto-screener/app/collector.py |  9 ++++++---
+ 2 files changed, 19 insertions(+), 13 deletions(-)
+
+diff --git a/crypto-screener/app/api.py b/crypto-screener/app/api.py
+index 07e94f6..e81557f 100644
+--- a/crypto-screener/app/api.py
++++ b/crypto-screener/app/api.py
+@@ -164,15 +164,13 @@ def select(query: dict[str, Any], with_densities: bool = False,
+     rows = prefiltered if prefiltered is not None \
+         else build_rows(with_densities=needs_dens)
+     if restrict is not None:
+-        # Сужаем только когда это безопасно: запрос про ту же биржу, что и
+-        # отбор (см. _restrict_universe). Иначе restrict вырезал бы из
+-        # «полной базы» все строки остальных бирж — при пустом или устаревшем
+-        # key_set фронт ловил 0-37 строк, считал бэкенд мёртвым и уходил в
+-        # демо-режим.
+-        if _restrict_universe(query, restrict):
+-            rows = [r for r in rows if r["k"] in restrict]
+-        else:
+-            restrict = None
++        # restrict — узкий WS-пуш: отдаём только то, что реально стримится
++        # (фокус-набор всегда с одной биржи; запросы без фильтра по бирже
++        # сюда не доходят — см. ws_stream). Флаг focus_ ставим ВСЕГДА, когда
++        # restrict передан: meta может быть прочитана из кэша полной выборки
++        # (тот же query без restrict), а клиент по этому флагу решает, резать
++        # ли таблицу под фокус.
++        rows = [r for r in rows if r["k"] in restrict]
+     dup = F.base_universe(rows) if params.get("unique") else None
+     rows = F.apply_filters(rows, params, dup)
+ 
+@@ -616,8 +614,13 @@ def _full_market_rows(query: dict[str, Any]) -> list[dict]:
+     rows = build_rows()
+     params = F.parse_params(query)
+     if params.get("ex"):
++        # то же регистронезависимое сравнение, что и в filters._passes:
++        # UI шлёт лейбл («Binance»), в строках id («binanceusdm») — иначе
++        # предфильтр вырезал всю вселенную и REST отдавал только top-N фокуса
+         wanted = {x.lower() for x in params["ex"]}
+-        rows = [r for r in rows if r["ex"] in wanted or r["exl"] in params["ex"]]
++        rows = [r for r in rows
++                if (r["ex"] or "").lower() in wanted
++                or (r["exl"] or "").lower() in wanted]
+     if params.get("mt"):
+         rows = [r for r in rows if r["mt"] == params["mt"]]
+     q = params.get("q") or params.get("q_base")
+diff --git a/crypto-screener/app/collector.py b/crypto-screener/app/collector.py
+index f539e15..12f315f 100644
+--- a/crypto-screener/app/collector.py
++++ b/crypto-screener/app/collector.py
+@@ -1002,9 +1002,9 @@ class ExchangeCollector:
+                 b["syms"] = []
+                 b["gen"] += 1
+             if self._batch_on(kind):
+-                self._sync_batch(kind, want)
++                await self._sync_batch(kind, want)
+ 
+-    def _sync_batch(self, kind: str, want: list[str]) -> None:
++    async def _sync_batch(self, kind: str, want: list[str]) -> None:
+         """
+         Список изменился → перезапускаем задачи чанков; отписка — фоново.
+ 
+@@ -1020,8 +1020,11 @@ class ExchangeCollector:
+         if pu is not None and not pu.done():
+             try:
+                 await asyncio.wait_for(asyncio.shield(pu), timeout=5.0)
+-            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
++            except asyncio.TimeoutError:
+                 pass
++            except Exception as e:  # noqa: BLE001
++                log.debug("[%s] ожидание отписки: %s: %s", self.cfg.label,
++                          type(e).__name__, str(e)[:120])
+         alive = [t for t in b["tasks"] if not t.done()]
+         rebuild = b.pop("rebuild", False)
+         if want == b["syms"] and not rebuild and (alive or not want):
+-- 
+2.39.5
+
