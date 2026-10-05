@@ -345,6 +345,14 @@ class ExchangeCollector:
         self._ticker_tasks: dict[str, asyncio.Task] = {}
         # WS-подписки на kline для сетки графиков (см. watch_candles)
         self._candle_tasks: dict[str, asyncio.Task] = {}
+        # tf каждого kline-потока: без этого un_watch уходил с НЕТОПОВЫМ tf
+        # (топик на бирже оставался висеть), а watch того же символа на новом
+        # tf натыкался на уже зарегистрированный messageHash → «already
+        # subscribed»/вечно висящий future → пустые плитки при смене отбора/tf
+        self._candle_tfs: dict[str, str] = {}
+        # целевой набор символов сетки графиков (последний watch_candles):
+        # keep-список для паузы — kline-потоки сетки не закрываем (см. _rotate_loop)
+        self._grid_syms: set[str] = set()
         self._id_map: dict[str, str] = {}
         self._sem_ohlcv = asyncio.Semaphore(settings.ohlcv_concurrency)
         # Троттл ФОНОВЫХ REST-запросов (подкачка 1m-свечей). Раньше фоновый
@@ -614,9 +622,15 @@ class ExchangeCollector:
     def paused(self) -> bool:
         return self._paused
 
-    def _close_streams(self) -> None:
+    def _close_streams(self, keep_candles: set | None = None) -> None:
         """
         Закрыть все WS-потоки; отписки на бирже — фоново.
+
+        keep_candles: символы, чьи kline-потоки сетки графиков ТРОГАТЬ НЕЛЬЗЯ
+        (пауза биржи вне фокуса не должна обесценивать плитки «Графиков»).
+        Поток живёт в _candle_tasks и сам засыпает во время паузы (_paused →
+        sleep), подписка на бирже остаётся в силе — данные придут сразу после
+        resume без переподписки и без «already subscribed».
 
         Раньше каждый un_watch_* ожидался здесь последовательно, и пауза биржи
         со 150 подписками (~130 отписок по ~0.3 c) блокировала ротацию на
@@ -648,22 +662,28 @@ class ExchangeCollector:
                 self._detach_batch_unwatch(kind, b["syms"])
                 b["syms"] = []
         if books or trades or tickers:
+            keep = keep_candles or set()
             self._pending_unwatch = asyncio.create_task(
-                self._drop_single_all(books, trades, tickers),
+                self._drop_single_all(books, trades, tickers, keep),
                 name=f"{self.cfg.id}:unwatch-all")
             self.tasks.add(self._pending_unwatch)
             self._pending_unwatch.add_done_callback(self.tasks.discard)
 
     async def _drop_single_all(self, books: list[str], trades: list[str],
-                               tickers: list[str]) -> None:
+                               tickers: list[str],
+                               keep_candles: set | None = None) -> None:
         await self._drop_single_subscriptions("book", books)
         await self._drop_single_subscriptions("trades", trades)
         await self._drop_single_subscriptions("tickers", tickers)
-        # kline-потоки сетки графиков — те же правила пересборки подписок
-        candles = sorted(self._candle_tasks)
-        for t in list(self._candle_tasks.values()):
-            t.cancel()
-        self._candle_tasks.clear()
+        # kline-потоки сетки графиков — те же правила пересборки подписок,
+        # но символы из keep_candles остаются подписанными (пауза биржи не
+        # должна обрывать живые графики /api/grid)
+        keep = keep_candles or set()
+        candles = sorted(s for s in self._candle_tasks if s not in keep)
+        for sym in candles:
+            t = self._candle_tasks.pop(sym, None)
+            if t:
+                t.cancel()
         if candles:
             await self._drop_single_subscriptions("candles", candles)
 
@@ -789,10 +809,28 @@ class ExchangeCollector:
         while not self._stop.is_set():
             try:
                 if self._paused:
-                    # биржа вне фокуса: подписок не держим вовсе
+                    # биржа вне фокуса: подписок не держим вовсе — КРОМЕ
+                    # kline-потоков сетки графиков. Раньше _close_streams()
+                    # гасил и их: плитки оставались без свечей, пока REST-
+                    # прогрев не пробивался через занятый семафор (таймаут 8 c)
+                    # → «выбрал биржу — графики есть; новый отбор/пауза фокуса
+                    # — свечи пропали». Символы сетки входят в пул стрима
+                    # (добавлены в hot/focus), поэтому лишней нагрузки нет.
+                    #
+                    # ВАЖНО: keep строится по _grid_syms (цели WS-подписки
+                    # сетки), а НЕ по пересечению с self.hot. Grid-символы
+                    # добавляются в hot только когда уже стримятся, поэтому
+                    # пересечение давало ПУСТОЙ keep для свежих кандидатов
+                    # нового отбора → пауза биржи снимала их kline-топики на
+                    # стороне ccxt, _candle_tasks оставались «живыми», и
+                    # watch_candles никогда их не переподписывал (sym in
+                    # _candle_tasks → continue). Итог: «плитки есть, свечей
+                    # нет» ровно после смены отбора/фокуса.
+                    grid_syms = set(getattr(self, "_grid_syms", set()) or ()) \
+                        | set(self._candle_tasks)
                     if (self._book_tasks or self._trade_tasks or self._ticker_tasks
                             or self._batch_alive()):
-                        self._close_streams()
+                        self._close_streams(keep_candles=grid_syms)
                     STORE.set_status(self.cfg.label, state="paused",
                                      symbols=len(self.symbols), books=0, trades=0,
                                      hot=0, banned=len(self._book_banned))
@@ -965,8 +1003,16 @@ class ExchangeCollector:
         """
         if kind == "candles":
             # kline-подписки сетки графиков живут отдельным dict и своим
-            # методом un_watch_ohlcv_for_symbols ([[sym, tf], ...])
-            pairs = [[s, getattr(self, "_candle_tf", "1m")] for s in symbols]
+            # методом un_watch_ohlcv_for_symbols ([[sym, tf], ...]). TF берём
+            # ИЗ ЗАПИСИ НА СИМВОЛ (_candle_tfs): раньше подставляли общий
+            # self._candle_tf — после смены таймфрейма отписка уходила с
+            # нетоповым ключом, ccxt не удалял messageHash, топик оставался
+            # «висеть», а следующая подписка того же символа на новый tf
+            # резолвила чужой future → пустые плитки до REST-прогрева.
+            pairs = [[s, self._candle_tfs.get(s)
+                      or getattr(self, "_candle_tf", "") or "1m"] for s in symbols]
+            for s in symbols:
+                self._candle_tfs.pop(s, None)
             if pairs and hasattr(self.ex, "un_watch_ohlcv_for_symbols"):
                 try:
                     await self.ex.un_watch_ohlcv_for_symbols(pairs)
@@ -1756,6 +1802,11 @@ class ExchangeCollector:
             if cached and now - cached[0] < GRID_TTL:
                 continue                       # сетка этого ТФ уже прогрета
             st = self._state(sym)
+            # WS kline уже принёс свечи нужного ТФ — REST не нужен вовсе
+            if (getattr(st, "grid_ohlcv", None)
+                    and getattr(st, "grid_ohlcv_tf", "") == tf
+                    and now - getattr(st, "grid_ohlcv_ts", 0.0) < GRID_TTL):
+                continue
             if st.ohlcv and now - getattr(st, "ohlcv_ts", 0.0) < CANDLES_TTL \
                     and self._fresh_candles_from_store(sym, tf, limit, now) is not None:
                 continue                       # resample из свежего 1m закроет нужду
@@ -1807,23 +1858,65 @@ class ExchangeCollector:
         """
         if self._stop.is_set():
             return
+        # Целевой набор сетки — переживает паузу: именно по нему ротация
+        # решает, какие kline-потоки НЕ закрывать (keep_candles в _close_streams).
+        self._grid_syms = set(symbols)
         # набор плиток изменился: снимаем потоки символов, которых больше нет
         # в запросе (у старых топиков освобождаем messageHashes ccxt — иначе
         # следующая подписка тем же символом получит «already subscribed»)
         want = set(symbols)
         for sym in [s for s in self._candle_tasks if s not in want]:
-            t = self._candle_tasks.pop(sym)
-            t.cancel()
+            t = self._candle_tasks.pop(sym, None)
+            if t:
+                t.cancel()
             await self._drop_single_subscriptions("candles", [sym])
+        # СНИМАЕМ старые kline-потоки символов, которые переподписываются на
+        # ДРУГОЙ таймфрейм. Без этого watch_ohlcv_for_symbols([sym, новый_tf])
+        # натыкался на уже зарегистрированный messageHash того же символа —
+        # ccxt никогда не резолвил новый future, задача «висела вечно», и
+        # сетка оставалась без свечей до REST-прогрева («свечи пропадают при
+        # новом отборе»: фронт переключает tf → ротация подписок ломалась).
+        resub = [s for s in symbols
+                 if s in self._candle_tasks and self._candle_tfs.get(s) != tf]
+        for sym in resub:
+            t = self._candle_tasks.pop(sym, None)
+            if t:
+                t.cancel()
+            await self._drop_single_subscriptions("candles", [sym])
+        prev_tf = getattr(self, "_candle_tf", "")
         self._candle_tf = tf
+        added = 0
         for sym in symbols:
-            if sym in self._candle_tasks or sym not in self.ex.markets:
+            if sym not in self.ex.markets:
                 continue
+            t = self._candle_tasks.get(sym)
+            if t is not None and not t.done():
+                continue
+            if t is not None:
+                # задача потока УМЕРЛА (ccxt NotSupported/NetworkError/
+                # BadSymbol): словарь мог остаться с finished-задачей —
+                # раньше watch пропускал её («sym in _candle_tasks →
+                # continue»), и символ навсегда оставался без WS-свечей,
+                # даже когда биржа снова отвечала. Чистим запись и
+                # переподписываемся заново.
+                self._candle_tasks.pop(sym, None)
+                self._candle_tfs.pop(sym, None)
+            self._candle_tfs[sym] = tf
             t = asyncio.create_task(self._candle_stream(sym, tf),
                                     name=f"{self.cfg.id}:candle:{sym}")
             self._candle_tasks[sym] = t
-            t.add_done_callback(lambda x, s=sym: self._candle_tasks.pop(s, None)
-                                if self._candle_tasks.get(s) is x else None)
+
+            def _on_done(x, s=sym):
+                if self._candle_tasks.get(s) is x:
+                    self._candle_tasks.pop(s, None)
+                    self._candle_tfs.pop(s, None)
+            t.add_done_callback(_on_done)
+            added += 1
+        if added or resub:
+            log.info("[сетка %s] ws-kline: +%d потоков tf=%s (был %s), "
+                     "переподписано %d, всего активных %d/%d",
+                     self.cfg.label, added, tf, prev_tf or "-", len(resub),
+                     len(self._candle_tasks), len(want))
 
     async def _candle_stream(self, symbol: str, tf: str) -> None:
         while not self._stop.is_set():
@@ -1843,7 +1936,30 @@ class ExchangeCollector:
                     first = ohlcv[0]
                     candles = first.get("candles") if isinstance(first, dict) else None
                 if candles:
-                    self._state(symbol).apply_ohlcv(candles)
+                    st = self._state(symbol)
+                    # ВАЖНО: пишем в отдельный буфер st.grid_ohlcv, а НЕ через
+                    # apply_ohlcv(). WS kline отдаёт свечи ЗАПРОШЕННОГО ТФ (5m),
+                    # а st.ohlcv — это 1m-буфер: NATR/фокус/скринер считаются
+                    # именно по нему. Раньше apply_ohlcv затирал 1m-историю
+                    # горсткой 5m-свечей → natr падал до 0 → монета вылетала
+                    # из отбора → состав сетки менялся каждые ~30 с →
+                    # perpetual churn подписок → «плитки есть, свечей нет».
+                    # Плюс метрики скринера начинали считаться по чужому ТФ.
+                    if (not isinstance(candles, list) or not candles
+                            or not isinstance(candles[0], (list, tuple))):
+                        continue
+                    st.grid_ohlcv = [list(c) for c in candles][-600:]
+                    st.grid_ohlcv_tf = tf
+                    st.grid_ohlcv_ts = time.time()
+                    # держим 1m-буфер живым для resample/NATR: если он пуст или
+                    # протух (пауза биржи вне фокуса добивала и этот поток),
+                    # фоновый REST подкачает 1m через _sem_rest
+                    if not st.ohlcv or time.time() - st.ohlcv_ts >= CANDLES_TTL:
+                        t = asyncio.create_task(
+                            self._fetch_ohlcv(symbol),
+                            name=f"{self.cfg.id}:gridfill:{symbol}")
+                        _GRID_WARM_TASKS.add(t)
+                        t.add_done_callback(_GRID_WARM_TASKS.discard)
                     STORE.bump("ws_messages")
             except asyncio.CancelledError:
                 return
@@ -1916,13 +2032,34 @@ class ExchangeCollector:
             формат объёма).
         """
         st = STORE.get(f"{self.cfg.id}:{symbol}")
-        if st is None or not st.ohlcv:
-            return None
-        if now - getattr(st, "ohlcv_ts", 0.0) >= CANDLES_TTL:
+        if st is None:
             return None
         from .metrics import TF_SECONDS, resample   # локально: снять риск цикла импортов
         tf_sec = TF_SECONDS.get(tf)
         if tf_sec is None:
+            return None
+        # Приоритет 1: WS kline-поток сетки уже держит готовые свечи НУЖНОГО ТФ
+        # (st.grid_ohlcv). Отдаём их мгновенно без биржи — это главный путь для
+        # /api/grid: раньше при паузе/ротации фокуса буфер пустел, TTL истёк, и
+        # каждая плитка уходила в REST-очередь с таймаутом → «свечи пропали».
+        gbuf = getattr(st, "grid_ohlcv", None)
+        if (gbuf and getattr(st, "grid_ohlcv_tf", "") == tf
+                and now - getattr(st, "grid_ohlcv_ts", 0.0) < GRID_TTL):
+            return [list(c) for c in gbuf[-limit:]]
+        # Приоритет 1b: тот же WS-буфер, но протухший (биржа замолчала на
+        # минуту). Раньше такая плитка шла в REST-очередь; если очередь была
+        # занята (ROTATE снимал/ставил подписки, warm_for_grid держал семафор),
+        # wait_for(8 c) отваливался и отдавал [] — фронт показывал «нет
+        # свечей», хотя история у него уже была в руках. Лучше показать
+        # чуть отстающий график, чем стереть живой: grid-буфер храним до
+        # 600 свечей, он актуален минутами.
+        if gbuf and getattr(st, "grid_ohlcv_tf", "") == tf \
+                and len(gbuf) >= 2:
+            return [list(c) for c in gbuf[-limit:]]
+        # Приоритет 2: resample из свежего 1m-буфера скринера
+        if not st.ohlcv:
+            return None
+        if now - getattr(st, "ohlcv_ts", 0.0) >= CANDLES_TTL:
             return None
         need_min = limit * 60 // max(1, tf_sec) + 2   # минут истории на нужный ТФ
         if len(st.ohlcv) < need_min:
@@ -2096,10 +2233,25 @@ class CollectorHub:
             return
         if cur.get(tf) == want and all(not t.done() for t in col._candle_tasks.values()):
             return
-        cur[tf] = want
+        # Состав СМЕНИЛСЯ (новый отбор): снимаем отметку «подписано» ДО await.
+        # watch_candles у медленной биржи висит десятки секунд (un_watch_* по
+        # каждой старой паре). Пока он висит, _grid_subs хранил УЖЕ НОВЫЙ
+        # состав — следующая волна /api/grid (через 15 с) видела «состав
+        # совпал», выходила как no-op, а реальные потоки ещё не были
+        # подписаны → get_grid шёл в REST-очередь, получал таймаут 8 c и
+        # отдавал плитки без свечей («свечи пропадают при новом отборе»).
+        # Теперь устаревшая волна не считается успешной и повторит попытку.
+        cur[tf] = None
+        # ФЛАГ ЗАНЯТОСТИ ДО await. Раньше счётчик ставился после первого
+        # await внутри watch_candles: две волны /api/grid успевали пройти
+        # проверку «active==0» одна за другой в одном тике цикла событий и
+        # параллельно отписывали/подписывали одни и те же kline-топики —
+        # gacha «already subscribed»/пустые плитки при каждом новом отборе.
         self._grid_sub_active[col.cfg.id] = active + 1
         try:
             await col.watch_candles(sorted(want), tf, 0)
+            cur[tf] = want      # отмечаем состав только когда подписка реальна
+                                # (см. комментарий про cur[tf] = None выше)
         except Exception as e:  # noqa: BLE001
             log.debug("[сетка] ws-kline %s: %s: %s", col.cfg.label,
                       type(e).__name__, str(e)[:140])
@@ -2183,8 +2335,23 @@ class CollectorHub:
             # из ключа символа ("mexc:BTC/USDT:USDT" -> swap), либо словарём
             # строки скринера.
             if isinstance(row, dict):
-                ex_id, sym = row.get("ex") or row.get("exl") or "", row.get("s") or ""
-                mt_hint = "swap" if ":USDT:USDT" in str(row.get("k", "")) \
+                rk = str(row.get("k") or "")
+                # КЛЮЧ строки скринера имеет вид "<cfg.id>:<symbol>"
+                # («binanceusdm:BTC/USDT:USDT»). Раньше маршрутизация шла по
+                # полю "ex"/"exl": у части строк оно пустое или это ЛЕЙБЛ
+                # («Binance»), а лейбл общий для спота и свопа — find() без
+                # подсказки рынка возвращал ПЕРВЫЙ коллектор биржи. Для
+                # Binance/Bybit/MEXC/Gate с приоритетом спот это значило:
+                # своповые плитки молча уходили в спотовый REST-коллектор,
+                # где символа нет → fetch_candles отдавал [] → «нет свечей»
+                # ровно на тех монетах, что меняются при новом отборе.
+                # Теперь первый сегмент ключа = точный cfg.id — всегда.
+                if ":" in rk:
+                    ex_id, sym = rk.split(":", 1)
+                else:
+                    ex_id, sym = (row.get("ex") or row.get("exl") or ""), \
+                                 row.get("s") or ""
+                mt_hint = "swap" if ":USDT:USDT" in sym or "/USDT:USDT" in sym \
                     else ("spot" if row.get("mt") == "spot" else "")
             else:
                 ex_id, sym = row[0], row[1]

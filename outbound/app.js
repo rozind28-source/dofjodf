@@ -29,7 +29,7 @@ const state = {
   filters: {},             // field → {min,max} | true
   exchanges: new Set(),
   mt: "swap",           // глобальный тумблер рынка: "swap" | "spot"
-  grid: { ex: "", tf: "5m", n: 9, cells: [], charts: new Map(), timer: null, tfSeconds: 300 },
+  grid: { ex: "", tf: "5m", n: 9, cells: [], charts: new Map(), timer: null, refill: null, tfSeconds: 300 },
   overview: null,
   ws: null,
   wsOk: false,
@@ -1423,6 +1423,8 @@ async function loadGrid() {
     head.textContent = "Графики" + (failed ? "  ·  сервер не ответил, показан кэш/демо" : "");
   }
   startGridTimer();
+  // часть плиток осталась без свечей — долить быстрее основного цикла
+  scheduleGridRefill();
 }
 
 function renderGridCells() {
@@ -1496,6 +1498,25 @@ function startGridTimer() {
   g.timer = setInterval(() => {
     if (state.view === "grid" && !document.hidden) loadGrid();
   }, 15000);
+}
+
+/**
+ * Быстрый «долёж» свечей: если в сетке есть плитки без них (сервер не успел
+ * догреть REST/WS после нового отбора), переспрашиваем /api/grid каждые 5 с,
+ * пока все графики не наполнятся. Не конфликтует с основным 15-секундным
+ * интервалом: loadGrid() перезапускает его через startGridTimer(), а здесь
+ * просто ставим ещё один короткий таймер (один одновременно).
+ */
+function scheduleGridRefill() {
+  const g = state.grid;
+  if (g.refill) return;            // уже долит
+  g.refill = setTimeout(() => {
+    g.refill = null;
+    if (state.view !== "grid" || document.hidden) return;
+    if (!g.cells || !g.cells.some((c) => !c.candles || !c.candles.length)) return;
+    loadGrid();                    // ответ снова пройдёт через merge+renderGridCells
+    scheduleGridRefill();          // если всё ещё пусто — продолжим долить
+  }, 5000);
 }
 
 /** DEMO-вариант сетки: тот же формат, что отдаёт /api/grid. */
