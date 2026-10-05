@@ -1366,7 +1366,7 @@ async function loadGrid() {
     // Пользователь отсортировал, например, по NATR — плитка строится в этом
     // же порядке, а не по объёму «как серверу удобнее».
     const q = Object.assign({}, collectQuery(),
-                            { ex: g.ex || "", mt: state.mt, tf: g.tf, n: g.n, limit: 250 });
+                            { ex: g.ex || "", mt: state.mt, tf: g.tf, n: g.n, limit: 100 });
     try {
       const r = await fetchT("/api/grid?" + new URLSearchParams(q).toString(), 15000);
       if (r.ok) d = await r.json();
@@ -1614,7 +1614,7 @@ async function loadCandles(key, row) {
   let failed = false;
   if (!state.demo) {
     try {
-      const r = await fetchT(`/api/candles?key=${encodeURIComponent(key)}&tf=${state.chartTf}&limit=400`, 12000);
+      const r = await fetchT(`/api/candles?key=${encodeURIComponent(key)}&tf=${state.chartTf}&limit=100`, 12000);
       if (r.ok) d = await r.json();
       else failed = true;
     } catch (e) { failed = true; d = null; }
@@ -1659,7 +1659,11 @@ function chartTick(row) {
 /** Синтетические свечи для DEMO-режима: тот же формат, что отдаёт бэкенд. */
 function demoCandles(key, row) {
   const tf = TF_SEC[state.chartTf] || 900;
-  const n = 187;   // намеренно нестандартное число: по нему тест отличает демо от ответа биржи
+  // 100 свечей — как в live-режиме (см. /api/candles?limit=100), чтобы
+  // DEMO и прод-картинка визуально совпадали. «187» был намеренным
+  // маркером отличия демо от биржи, но с этим числом демо-график выглядел
+  // заметно длиннее живого и вводил в заблуждение.
+  const n = 100;
   const now = Math.floor(Date.now() / 1000);
   const end = now - (now % tf);
   const last = row && row.last ? row.last : 100;

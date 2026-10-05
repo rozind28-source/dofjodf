@@ -25,7 +25,11 @@ class CandleChart {
       crossColor: "rgba(180,200,225,.45)",
       padLeft: 6, padRight: 64, padTop: 10, padBottom: 20,
       volRatio: 0.2,          // доля высоты под объём
-      minBars: 20, maxBars: 600,
+      // 150 — компромисс: свечей на экране 100 (как отдаёт /api/candles),
+      // зум до 150 даёт небольшой запас, чтобы разглядеть детали, но не
+      // раздувает полотно до неудобной ширины. Было 600 — «простыня»,
+      // которую пользователь не мог охватить взглядом.
+      minBars: 20, maxBars: 150,
     }, opts);
 
     this.data = { candles: [], densities: [], spikes: [], last: null };

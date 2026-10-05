@@ -100,7 +100,15 @@ CORE_EXCHANGES: list[ExchangeConfig] = [
                    batch_full_unwatch=True),
     ExchangeConfig("bybit",       "Bybit",       "swap", top_n=250, books=60, batch_chunk=10),
     ExchangeConfig("okx",         "OKX",         "swap", top_n=250, books=60),
-    ExchangeConfig("mexc",        "MEXC",        "swap", top_n=250, books=50, ticker_refresh=30.0,
+    # MEXC — самая тяжёлая биржа по WS: стакан всегда ~1500 уровней (limit
+    # игнорируется), ccxt мультиплексирует ВСЕ подписки на одной WS-сессии,
+    # и её ping не успевает уйти под нагрузкой → «ping-pong keepalive
+    # missing on time», лавина RequestTimeout на все символы сразу и
+    # «Future exception was never retrieved» от мёртвых задач.
+    # books=15 втрое сокращает поток по одному WS-соединению; плотности
+    # показываются на тех же 15 монетах, что и раньше (первая по объёму
+    # часть hot-набора), — визуально ничего не теряется.
+    ExchangeConfig("mexc",        "MEXC",        "swap", top_n=250, books=15, ticker_refresh=30.0,
                    ohlcv_vol_in_contracts=True),
     # Gate futures.order_book_update принимает limit не больше 100:
     # при 200 отвечает BadRequest на ВСЕ символы (проверено замером).
@@ -113,7 +121,7 @@ CORE_EXCHANGES: list[ExchangeConfig] = [
                    batch_full_unwatch=True),
     ExchangeConfig("bybit",       "Bybit",       "spot", top_n=150, books=20, batch_chunk=10),
     ExchangeConfig("okx",         "OKX",         "spot", top_n=150, books=20),
-    ExchangeConfig("mexc",        "MEXC",        "spot", top_n=150, books=20, ticker_refresh=30.0),
+    ExchangeConfig("mexc",        "MEXC",        "spot", top_n=150, books=8, ticker_refresh=30.0),
     ExchangeConfig("gate",        "Gate.io",     "spot", top_n=150, books=20, book_limit=100),
     # --- DEX (perp): спота у них нет, тумблер это учитывает ---
     ExchangeConfig("aster",       "Aster",       "swap", top_n=200, books=40, dex=True),
