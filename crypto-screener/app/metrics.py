@@ -141,6 +141,10 @@ class SymbolState:
         "buy_quote_min", "sell_quote_min", "trades_min", "prints_min",
         "cvd", "cvd_1m", "cvd_5m", "delta_1m",
         "ohlcv", "ohlcv_ts", "natr", "natr_period",
+        # буфер свечей сетки графиков (см. __init__) — ОБЯЗАТЕЛЬНО в __slots__:
+        # без этого присваивание в __init__ падает с AttributeError на старте,
+        # и все ticker-loop'ы бирж умирают в первые секунды
+        "grid_ohlcv", "grid_ohlcv_tf", "grid_ohlcv_ts",
         "minute_vols", "minute_trades", "spike_vol_ratio", "spike_tr_ratio",
         "book", "imbalance", "densities", "big_densities", "_dens_calc",
         "funding", "open_interest", "open_interest_usd", "oi_change_pct",
