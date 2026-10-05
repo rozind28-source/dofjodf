@@ -1431,11 +1431,22 @@ function renderGridCells() {
   const g = state.grid;
   const host = $("#charts-grid");
   if (!host) return;
-  // уничтожаем лишние чарты
-  for (const [k, ch] of Array.from(g.charts)) {
-    if (!g.cells.some((c) => c.k === k)) { g.charts.delete(k); }
+  // Переиспользуем ячейки по dataset.k, а не пересоздаём DOM целиком.
+  //
+  // Было: host.innerHTML = "" — и если очередная волна /api/grid принесла
+  // для части плиток пустые candles, живые графики стирались и заменялись
+  // на «нет свечей». Серверный merge (см. get_grid) эту дыру уже закрывает,
+  // но клиентская перерисовка всё равно не должна сносить canvas: у живой
+  // ячейки уже есть масштаб/зум/позиция, их потеря выглядит как «график
+  // пропал и появился заново».
+  const wantKeys = new Set(g.cells.map((c) => c.k));
+  for (const el of Array.from(host.children)) {
+    if (!wantKeys.has(el.dataset.k)) { el.remove(); g.charts.delete(el.dataset.k); }
   }
-  host.innerHTML = "";
+  // индекс существующих ячеек по ключу
+  const existing = new Map();
+  for (const el of host.children) existing.set(el.dataset.k, el);
+
   if (!g.cells.length) {
     const f = state.focus;
     const why = f.enabled
@@ -1445,33 +1456,79 @@ function renderGridCells() {
       : `Нет данных: для «${esc(g.ex || "всех бирж")}» рынок
          «${state.mt === "spot" ? "спот" : "фьючерсы"}» не подключён или пуст.
          ${state.mt === "spot" ? "Попробуйте переключиться на фьючерсы." : ""}`;
-    host.innerHTML = `<div class="cc-empty" style="grid-column:1/-1">${why}</div>`;
+    if (!host.querySelector(".cc-empty")) {
+      host.innerHTML = `<div class="cc-empty" style="grid-column:1/-1">${why}</div>`;
+    } else {
+      host.querySelector(".cc-empty").innerHTML = why;
+    }
     return;
   }
   for (const cell of g.cells) {
-    const el = document.createElement("div");
-    el.className = "chart-cell";
-    el.dataset.k = cell.k;
-    el.innerHTML = `
-      <div class="cc-head">
-        <span class="cc-sym">${esc(cell.b || cell.s)}</span>
-        <span class="cc-ex">${esc(cell.exl)}${cell.dex ? " ◆" : ""}</span>
-        <span class="cc-chg ${cell.chg > 0 ? "pos" : cell.chg < 0 ? "neg" : ""}">${fmt.pct(cell.chg, 2)}</span>
-        <button class="cc-pick" title="Открыть карточку инструмента">⤢</button>
-      </div>
-      <div class="cc-body"><canvas></canvas></div>
-      ${cell.spike ? '<div class="cc-spike" title="спайк объёма/сделок">⚡</div>' : ""}`;
-    host.appendChild(el);
-    $(".cc-pick", el).addEventListener("click", (ev) => { ev.stopPropagation(); openDrawer(cell.k); });
-    el.addEventListener("dblclick", () => openDrawer(cell.k));
+    let el = existing.get(cell.k);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "chart-cell";
+      el.dataset.k = cell.k;
+      el.innerHTML = `
+        <div class="cc-head">
+          <span class="cc-sym">${esc(cell.b || cell.s)}</span>
+          <span class="cc-ex">${esc(cell.exl)}${cell.dex ? " ◆" : ""}</span>
+          <span class="cc-chg ${cell.chg > 0 ? "pos" : cell.chg < 0 ? "neg" : ""}">${fmt.pct(cell.chg, 2)}</span>
+          <button class="cc-pick" title="Открыть карточку инструмента">⤢</button>
+        </div>
+        <div class="cc-body"><canvas></canvas></div>
+        ${cell.spike ? '<div class="cc-spike" title="спайк объёма/сделок">⚡</div>' : ""}`;
+      host.appendChild(el);
+      $(".cc-pick", el).addEventListener("click", (ev) => { ev.stopPropagation(); openDrawer(cell.k); });
+      el.addEventListener("dblclick", () => openDrawer(cell.k));
+    } else {
+      // ячейка уже есть — обновляем только шапку, canvas не трогаем
+      const head = el.querySelector(".cc-head");
+      if (head) {
+        const chgEl = head.querySelector(".cc-chg");
+        if (chgEl) {
+          chgEl.className = "cc-chg " + (cell.chg > 0 ? "pos" : cell.chg < 0 ? "neg" : "");
+          chgEl.textContent = fmt.pct(cell.chg, 2);
+        }
+      }
+      // индикатор спайка мог появиться/исчезнуть
+      const hasSpike = !!el.querySelector(".cc-spike");
+      if (cell.spike && !hasSpike) {
+        const s = document.createElement("div");
+        s.className = "cc-spike";
+        s.title = "спайк объёма/сделок";
+        s.textContent = "⚡";
+        el.appendChild(s);
+      } else if (!cell.spike && hasSpike) {
+        el.querySelector(".cc-spike").remove();
+      }
+    }
 
     const cv = $("canvas", el);
     if (!cell.candles || !cell.candles.length) {
       const body = $(".cc-body", el);
-      body.innerHTML = `<div class="cc-empty">нет свечей${cell.candles_ok === false ? " (таймаут биржи)" : ""}</div>`;
-      host.appendChild(el);
+      // Пустые свечи, но canvas уже был: НЕ стираем его. Оставляем
+      // последний успешный график и показываем поверх маленькую пометку.
+      // Раньше `body.innerHTML = ...` сносил canvas, и на один-два цикла
+      // (пока не догреются свечи) плитка «мигала» пустотой.
+      if (body.querySelector("canvas")) {
+        let hint = body.querySelector(".cc-hint");
+        if (!hint) {
+          hint = document.createElement("div");
+          hint.className = "cc-hint";
+          hint.style.cssText =
+            "position:absolute;right:6px;bottom:4px;font:9.5px var(--mono);color:var(--txt3)";
+          body.appendChild(hint);
+        }
+        hint.textContent = "обновление…";
+      } else {
+        body.innerHTML = `<div class="cc-empty">нет свечей${cell.candles_ok === false ? " (таймаут биржи)" : ""}</div>`;
+      }
       continue;
     }
+    // свечи пришли — прячем пометку «обновление…», если она была
+    const hint = $(".cc-hint", el);
+    if (hint) hint.remove();
     let ch = g.charts.get(cell.k);
     if (!ch && typeof CandleChart !== "undefined") {
       ch = new CandleChart(cv, { padRight: 52, padBottom: 16, volRatio: 0.22, minBars: 20 });

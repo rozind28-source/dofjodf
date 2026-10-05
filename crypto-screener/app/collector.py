@@ -2217,6 +2217,10 @@ class CollectorHub:
         self.tasks: list[asyncio.Task] = []
         # кэш готовых сеток /api/grid: key → (ts, cells); см. get_grid()
         self._grids: dict[tuple, tuple[float, list]] = {}
+        # последние УДАЧНЫЕ свечи по (символ, tf): нужен для серверного
+        # merge, когда состав сетки сменился и у клиента нет prev-ячейки
+        # (см. get_grid). Храним 5 минут.
+        self._last_good_candles: dict[tuple[str, str], tuple[float, list]] = {}
         # WS kline-подписки сетки: collector id → {tf: набор символов}
         self._grid_subs: dict[str, dict[str, set]] = {}
         # незавершённые подписки по коллектору: не даём двум волнам /api/grid
@@ -2393,15 +2397,17 @@ class CollectorHub:
         # (запросы к биржам), таймаут 0 мгновенно вернёт TimeoutError —
         # выдача ячеек не блокируется подпиской; если планировщик пуст
         # (тесты/демо), подписка успевает зарегистрироваться до gather.
+        # ВАЖНО: не ждём подписку через wait_for(..., timeout=0) — этот
+        # приём «дать задаче шанс запуститься» НЕ работал: если в цикле
+        # событий уже есть I/O (а он тут всегда есть — fetch_candles идут
+        # ниже), wait_for таймаутит мгновенно, WS-подписка не успевает
+        # встать, и первый get_grid после смены набора уходит в REST с
+        # таймаутом 8 c. Просто создаём задачу — она выполнится сама.
         for c, syms in by_col.items():
             t = asyncio.create_task(self._resubscribe_grid(c, syms, tf),
                                     name=f"gridsub:{c.cfg.id}")
             _GRID_WARM_TASKS.add(t)
             t.add_done_callback(_GRID_WARM_TASKS.discard)
-            try:
-                await asyncio.wait_for(asyncio.shield(t), timeout=0)
-            except asyncio.TimeoutError:
-                pass
         # фон: добираем 1m-свечи недостающим символам (см. warm_for_grid)
         for c, syms in by_col.items():
             self._grid_warm(c, syms, tf, limit)
@@ -2426,7 +2432,29 @@ class CollectorHub:
         # параллельно по всем ячейкам: при последовательном опросе сетка из
         # 25 плиток на медленной бирже складывалась в минуты ожидания
         results = await asyncio.gather(*[one(r, c) for r, c in zip(rows, routes)])
+        # Серверный merge последнего успешного ответа по паре (символ, tf).
+        #
+        # Зачем на сервере, а не только на клиенте (там уже есть prevByKey):
+        # клиентский merge спасает ТОЛЬКО когда gkey совпадает. В фокусе
+        # отбор пересчитывается каждые 15 c, набор ключей меняется — у
+        # клиента для нового ключа нет prev, и первый промах REST (таймаут
+        # биржи) сразу рисует «нет свечей». Здесь же мы помним последние
+        # удачные свечи по символу и ТФ, независимо от того, что состав
+        # сетки поменялся.
+        now_ts = time.time()
         for row, candles in zip(rows, results):
+            rk = row["k"] if isinstance(row, dict) else None
+            if rk and candles:
+                self._last_good_candles[(rk, tf)] = (now_ts, candles)
+        for row, candles in zip(rows, results):
+            rk = row["k"] if isinstance(row, dict) else None
+            if rk and not candles:
+                prev = self._last_good_candles.get((rk, tf))
+                # 5 минут — с запасом больше GRID_TTL; дольше держать не
+                # нужно: за это время либо WS kline восстановится, либо
+                # символ окончательно выпал из отбора.
+                if prev and now_ts - prev[0] < 300.0:
+                    candles = prev[1]
             cells.append(build_cell(row, candles))
         self._grids[key] = (time.time(), cells)
         if len(self._grids) > GRID_CACHE_MAX:
@@ -2435,17 +2463,34 @@ class CollectorHub:
         return cells
 
     def _grid_warm(self, col, syms: list[str], tf: str, limit: int) -> None:
-        """Разовая фоновая задача прогрева свечей сетки (не ждём ответа)."""
-        # Одна волна на биржу: пока предыдущий прогрев не разобран, новые
-        # вызовы /api/grid просто пропускаем — данные доходят из уже идущей
-        # очереди, дубли только забивают _sem_rest и плодят таймауты.
+        """
+        Разовая фоновая задача прогрева свечей сетки (не ждём ответа).
+
+        Раньше: если волна прогрева уже идёт, новый вызов молча пропускался
+        (``_grid_warm_busy = True`` → ``return``). При ротации фокуса (раз в
+        15 с) новый набор монет не прогревался вовсе, пока висела старая
+        волна (медленная биржа + занятый ``_sem_rest`` — десятки секунд).
+        Сетка получала пустые ячейки и рисовала «нет свечей».
+
+        Теперь: последний пришедший запрос перезаписывает pending-слот, а
+        активная задача после завершения текущей волны сразу берёт
+        актуальный набор из pending и греет его. Ни один вызов ``_grid_warm``
+        не теряется.
+        """
+        col._grid_warm_pending = (list(syms), tf, limit)
         if getattr(col, "_grid_warm_busy", False):
             return
         col._grid_warm_busy = True
 
         async def run() -> None:
             try:
-                await col.warm_for_grid(syms, tf, limit)
+                while True:
+                    pending = getattr(col, "_grid_warm_pending", None)
+                    if not pending:
+                        break
+                    col._grid_warm_pending = None
+                    s, t, l = pending
+                    await col.warm_for_grid(s, t, l)
             finally:
                 col._grid_warm_busy = False
 
