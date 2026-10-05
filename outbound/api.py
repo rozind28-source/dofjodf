@@ -777,6 +777,15 @@ async def api_grid(request: Request):
     rows = [r for r in all_rows if (not ex or r["exl"] == ex) and r["mt"] == mt]
     rows = F.apply_filters(rows, F.parse_params(qp),
                            F.base_universe(rows) if qp.get("unique") else None)
+    # В фокусе ячейки сетки обязаны совпадать с отбором: только для этих
+    # монет держатся WS kline / 1m-буфер. Раньше сетка брала топ из ВСЕЙ
+    # биржи, а стрим шёл только по focus.key_set — свежие «не те» монеты
+    # уходили в REST с таймаутом 8 c и рождались пустыми. Пока отбор
+    # предварительный (provisional) или пустой (свечи ещё едут) — фильтр
+    # не применяем: иначе сетка схлопнется до нуля.
+    if focus_on and focus.keys and not focus.provisional:
+        focus_set = set(focus.keys)
+        rows = [r for r in rows if r["k"] in focus_set]
     sort_key = qp.get("sort", "vol")
     if sort_key not in F.SORT_FIELDS:
         sort_key = "vol"
