@@ -451,6 +451,43 @@ async def _loop_lag_monitor() -> None:
 app = FastAPI(title="Crypto Screener (self-hosted)", version="0.1.0", lifespan=lifespan)
 
 
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """
+    Фильтр шума от ccxt.pro при обрыве WS-сессий.
+
+    ccxt мультиплексирует подписки одного вида на одной WS-сессии. Когда
+    она умирает (ping-pong keepalive missed, как у MEXC), ccxt циклом
+    проходит по всем futures в client.subscriptions и ставит каждому
+    exception. Для символов, чьи задачи _book_stream уже отменены ротацией,
+    future никто не await-ит — Python ругается
+    «Future exception was never retrieved» и печатает полный traceback.
+
+    Это НЕ потеря данных: живые потоки получат тот же RequestTimeout в
+    свой await, обработают его в except-ветке и переподключатся сами
+    (backoff + _batch_fail / _book_stream логика). Мёртвые задачи уже не
+    работают, и их «необработанные» исключения ничего не значат.
+
+    Глушим ТОЛЬКО этот класс сообщений: реальные ошибки (unhandled
+    exception в задаче, ошибки event loop) уходят в дефолтный хендлер и
+    остаются видны в логе.
+    """
+    msg = context.get("message", "")
+    exc = context.get("exception")
+    if "Future exception was never retrieved" in msg:
+        # RequestTimeout от ccxt — ожидаемое следствие обрыва WS, гасим
+        # молча; для остальных причин оставляем одну короткую строку,
+        # чтобы не потерять что-то необычное.
+        if exc is not None and type(exc).__name__ != "RequestTimeout":
+            log.debug("фоновая задача: %s: %s", type(exc).__name__, str(exc)[:200])
+        return
+    loop.default_exception_handler(context)
+
+
+@app.on_event("startup")
+async def _install_asyncio_exception_handler() -> None:
+    asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
+
+
 @app.middleware("http")
 async def _log_errors(request: Request, call_next):
     """
@@ -702,9 +739,12 @@ async def api_candles(request: Request):
         return JSONResponse({"error": f"неподдерживаемый таймфрейм {tf!r}",
                              "supported": sorted(TF_SECONDS)}, status_code=400)
     try:
-        limit = max(20, min(int(qp.get("limit", 300)), 1000))
+        # 100 свечей хватает для визуального контроля тренда; больше — уже
+        # не «удобно отслеживать» (жалоба пользователя), а полотно, которое
+        # не влезает в карточку без скролла/зума.
+        limit = max(20, min(int(qp.get("limit", 100)), 200))
     except (TypeError, ValueError):
-        limit = 300
+        limit = 100
 
     st = STORE.get(key)
     if not st:
@@ -761,9 +801,9 @@ async def api_grid(request: Request):
                              "supported": sorted(TF_SECONDS)}, status_code=400)
     try:
         n = max(1, min(int(qp.get("n", 9)), 25))
-        limit = max(20, min(int(qp.get("limit", 200)), 400))
+        limit = max(20, min(int(qp.get("limit", 100)), 200))
     except (TypeError, ValueError):
-        n, limit = 9, 200
+        n, limit = 9, 100
 
     # «Графики» = то, что сейчас показывает скринер: те же query-параметры
     # (фильтры + сортировка + поиск), та же сортировка. Фронт присылает их
