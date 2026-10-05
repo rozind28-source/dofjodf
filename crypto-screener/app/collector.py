@@ -350,6 +350,11 @@ class ExchangeCollector:
         # tf натыкался на уже зарегистрированный messageHash → «already
         # subscribed»/вечно висящий future → пустые плитки при смене отбора/tf
         self._candle_tfs: dict[str, str] = {}
+        # Флаг «по этой бирже уже идёт волна прогрева свечей для сетки».
+        # Без него каждые 15 с (/api/grid) вставала новая волна warm_for_grid
+        # поверх висящей старой: очередь _sem_rest раздувалась дублями, а
+        # срочные запросы карточек/графиков задыхались за ними.
+        self._grid_warm_busy = False
         # целевой набор символов сетки графиков (последний watch_candles):
         # keep-список для паузы — kline-потоки сетки не закрываем (см. _rotate_loop)
         self._grid_syms: set[str] = set()
@@ -1797,15 +1802,21 @@ class ExchangeCollector:
         now = time.time()
         todo = []
         ck_tail = (tf, limit)
+        # Ограничиваем прогрев сверху: при сетке 25 плиток и gather по всему
+        # списку каждая плитка держала слот _sem_rest до 8 с — очередь
+        # расходилась минутами, а /api/grid каждые 15 с запускал НОВУЮ волну
+        # прогрева поверх висящей старой. Старые волны теперь отбрасываются
+        # флагом _grid_warm_busy, новые получают приоритет верхних строк.
         for sym in symbols:
             cached = self._candles_cache.get((sym,) + ck_tail)
             if cached and now - cached[0] < GRID_TTL:
                 continue                       # сетка этого ТФ уже прогрета
             st = self._state(sym)
             # WS kline уже принёс свечи нужного ТФ — REST не нужен вовсе
+            gts = getattr(st, "grid_ohlcv_ts", 0.0)
             if (getattr(st, "grid_ohlcv", None)
                     and getattr(st, "grid_ohlcv_tf", "") == tf
-                    and now - getattr(st, "grid_ohlcv_ts", 0.0) < GRID_TTL):
+                    and now - gts < min(GRID_TTL, 300.0)):
                 continue
             if st.ohlcv and now - getattr(st, "ohlcv_ts", 0.0) < CANDLES_TTL \
                     and self._fresh_candles_from_store(sym, tf, limit, now) is not None:
@@ -2042,31 +2053,35 @@ class ExchangeCollector:
         # (st.grid_ohlcv). Отдаём их мгновенно без биржи — это главный путь для
         # /api/grid: раньше при паузе/ротации фокуса буфер пустел, TTL истёк, и
         # каждая плитка уходила в REST-очередь с таймаутом → «свечи пропали».
+        # OKX/Aster/Hyperliquid умеют kline только по WS — для них этот пункт
+        # вообще единственный источник сетевых данных.
         gbuf = getattr(st, "grid_ohlcv", None)
-        if (gbuf and getattr(st, "grid_ohlcv_tf", "") == tf
-                and now - getattr(st, "grid_ohlcv_ts", 0.0) < GRID_TTL):
-            return [list(c) for c in gbuf[-limit:]]
-        # Приоритет 1b: тот же WS-буфер, но протухший (биржа замолчала на
-        # минуту). Раньше такая плитка шла в REST-очередь; если очередь была
-        # занята (ROTATE снимал/ставил подписки, warm_for_grid держал семафор),
-        # wait_for(8 c) отваливался и отдавал [] — фронт показывал «нет
-        # свечей», хотя история у него уже была в руках. Лучше показать
-        # чуть отстающий график, чем стереть живой: grid-буфер храним до
-        # 600 свечей, он актуален минутами.
-        if gbuf and getattr(st, "grid_ohlcv_tf", "") == tf \
-                and len(gbuf) >= 2:
-            return [list(c) for c in gbuf[-limit:]]
-        # Приоритет 2: resample из свежего 1m-буфера скринера
-        if not st.ohlcv:
-            return None
-        if now - getattr(st, "ohlcv_ts", 0.0) >= CANDLES_TTL:
-            return None
-        need_min = limit * 60 // max(1, tf_sec) + 2   # минут истории на нужный ТФ
-        if len(st.ohlcv) < need_min:
-            return None
-        if tf_sec == 60:
-            return [list(c) for c in st.ohlcv[-limit:]]
-        return resample(st.ohlcv, tf_sec)[-limit:]
+        if gbuf and getattr(st, "grid_ohlcv_tf", "") == tf:
+            fresh_ws = now - getattr(st, "grid_ohlcv_ts", 0.0) < GRID_TTL
+            # Протухший WS-буфер тоже отдаём (лучше отстающий график, чем
+            # стёртый), НО не бесконечно: дольше 5 минут каймы — считаем поток
+            # мёртвым и идём греться через REST (см. _warm_tf). Без этого
+            # ограничения обрыв WS после ротации паузы оставался незамеченным:
+            # get_grid видел «данные есть», прогрев пропускал символ, и плитки
+            # жили на последних свечах до следующей смены состава — «первые
+            # ~45 с графики есть, потом они гаснут/зависают».
+            if fresh_ws or now - getattr(st, "grid_ohlcv_ts", 0.0) < 300.0:
+                return [list(c) for c in gbuf[-limit:]]
+        # Приоритет 2: resample из 1m-буфера скринера.
+        # Раньше требовалась свежесть в CANDLES_TTL (12 с) — но во время паузы
+        # биржи вне фокуса 1m-стрим молчит, ohlcv_ts замирает, и ВСЕ плитки
+        # сетки одновременно слетали в REST-очередь (семафор + лимит биржи),
+        # большинство отваливалось по таймауту 8 с → «нет свечей» ровно через
+        # полминуты после переключения фокуса. Теперь историю принимаем до 10
+        # минут: цена последней свечи всё равно освежается WS-тиками фронта
+        # (gridTick), а форма графика за несколько минут почти не меняется.
+        if st.ohlcv and now - getattr(st, "ohlcv_ts", 0.0) < 600.0:
+            need_min = limit * 60 // max(1, tf_sec) + 2   # минут истории на нужный ТФ
+            if len(st.ohlcv) >= need_min:
+                if tf_sec == 60:
+                    return [list(c) for c in st.ohlcv[-limit:]]
+                return resample(st.ohlcv, tf_sec)[-limit:]
+        return None
 
     def _prune_candles_cache(self, now: float) -> None:
         """
@@ -2421,8 +2436,20 @@ class CollectorHub:
 
     def _grid_warm(self, col, syms: list[str], tf: str, limit: int) -> None:
         """Разовая фоновая задача прогрева свечей сетки (не ждём ответа)."""
-        t = asyncio.create_task(col.warm_for_grid(syms, tf, limit),
-                                name=f"gridwarm:{col.cfg.id}")
+        # Одна волна на биржу: пока предыдущий прогрев не разобран, новые
+        # вызовы /api/grid просто пропускаем — данные доходят из уже идущей
+        # очереди, дубли только забивают _sem_rest и плодят таймауты.
+        if getattr(col, "_grid_warm_busy", False):
+            return
+        col._grid_warm_busy = True
+
+        async def run() -> None:
+            try:
+                await col.warm_for_grid(syms, tf, limit)
+            finally:
+                col._grid_warm_busy = False
+
+        t = asyncio.create_task(run(), name=f"gridwarm:{col.cfg.id}")
         # self.tasks — список LONG-lived задач бирж (см. __init__/start);
         # у list нет .discard(), и сам прогрев не должен попадать в gather
         # остановки. Храним слабую ссылку, чтобы таск не собирались GC-раньше
